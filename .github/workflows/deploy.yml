@@ -2,95 +2,81 @@ name: DevOps AI Pipeline
 
 on:
   push:
-    branches:
-      - main
+    branches: [ main ]
 
 jobs:
-  build_and_deploy:
+  deploy:
     runs-on: ubuntu-latest
     env:
       AWS_REGION: us-east-1
       AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
       ECR_REPO: devops-ai-demo
-      INSTANCE_NAME: github-devops-instance
       IMAGE_TAG: ${{ github.sha }}
+      INSTANCE_NAME: github-devops-instance
 
     steps:
-      - name: Checkout code
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Configure AWS credentials
+      - name: Configure AWS
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Login to Amazon ECR
-        id: login-ecr
+      - name: Login to ECR
+        id: ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Create ECR Repository
-        run: |
-          if ! aws ecr describe-repositories --repository-names ${{ env.ECR_REPO }} --region ${{ env.AWS_REGION }} >/dev/null 2>&1; then
-            aws ecr create-repository --repository-name ${{ env.ECR_REPO }} --region ${{ env.AWS_REGION }}
-          fi
-
-      - name: Build & Push to ECR
+      - name: Build & Push
         env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          IMAGE_URI: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ env.IMAGE_TAG }}
+          IMAGE_URI: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ env.IMAGE_TAG }}
         run: |
           docker build -t ${{ env.ECR_REPO }} .
           docker tag ${{ env.ECR_REPO }}:latest ${{ env.IMAGE_URI }}
           docker push ${{ env.IMAGE_URI }}
           echo "IMAGE_URI=${{ env.IMAGE_URI }}" >> $GITHUB_ENV
 
-      - name: AI Code Review
-        if: ${{ env.OPENAI_API_KEY != '' }}
+      - name: AI Review (opcional)
+        if: ${{ secrets.OPENAI_API_KEY != '' }}
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
-          CONTENT=$(cat Dockerfile)
           curl -s https://api.openai.com/v1/chat/completions \
             -H "Authorization: Bearer $OPENAI_API_KEY" \
             -H "Content-Type: application/json" \
-            -d '{
-              "model": "gpt-4o-mini",
-              "messages": [{"role": "user", "content": "Review this Dockerfile:\n\n'"$CONTENT"'"}]
-            }' | jq -r '.choices[0].message.content'
+            -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Review Dockerfile:\n\n'"$(cat Dockerfile)"'"}]}' | jq -r '.choices[0].message.content'
 
       - name: Launch EC2
-        id: ec2
         run: |
-          AMI_ID=$(aws ec2 describe-images \
-            --owners amazon \
+          # AMI más reciente
+          AMI=$(aws ec2 describe-images --owners amazon \
             --filters "Name=name,Values=amzn2-ami-hvm-*-x86_64-gp2" "Name=state,Values=available" \
             --query 'Images | sort_by(@, &CreationDate) | [-1].ImageId' \
-            --output text --region ${{ env.AWS_REGION }})
+            --output text)
 
+          # Validar variables
           if [ -z "${{ vars.SUBNET_ID }}" ] || [ -z "${{ vars.SECURITY_GROUP_ID }}" ]; then
-            echo "ERROR: Set SUBNET_ID and SECURITY_GROUP_ID in GitHub Variables!"
+            echo "ERROR: Set SUBNET_ID and SECURITY_GROUP_ID in GitHub Variables"
             exit 1
           fi
 
-          cat > user-data.sh << 'EOF'
-#!/bin/bash
-yum update -y
-yum install -y docker
-systemctl start docker
-systemctl enable docker
-usermod -aG docker ec2-user
-$(aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com)
-docker pull ${{ env.IMAGE_URI }}
-docker run -d -p 80:80 ${{ env.IMAGE_URI }}
-EOF
+          # User data (sin heredoc problemático)
+          printf '%s\n' \
+            '#!/bin/bash' \
+            'yum update -y' \
+            'yum install -y docker' \
+            'systemctl start docker' \
+            'systemctl enable docker' \
+            'usermod -aG docker ec2-user' \
+            'aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com' \
+            'docker pull ${{ env.IMAGE_URI }}' \
+            'docker run -d -p 80:80 ${{ env.IMAGE_URI }}' > user-data.sh
 
-          INSTANCE_ID=$(aws ec2 run-instances \
-            --image-id "$AMI_ID" \
+          # Lanzar EC2
+          ID=$(aws ec2 run-instances \
+            --image-id "$AMI" \
             --instance-type t3.micro \
             --key-name MyKeyPair \
             --security-group-ids ${{ vars.SECURITY_GROUP_ID }} \
@@ -98,19 +84,18 @@ EOF
             --iam-instance-profile Name=EC2ECRAccessRole \
             --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${{ env.INSTANCE_NAME }}}]" \
             --user-data file://user-data.sh \
-            --query 'Instances[0].InstanceId' \
-            --output text \
-            --region ${{ env.AWS_REGION }})
+            --query 'Instances[0].InstanceId' --output text)
 
-          echo "INSTANCE_ID=$INSTANCE_ID" >> $GITHUB_ENV
+          echo "INSTANCE_ID=$ID" >> $GITHUB_ENV
 
-      - name: Get Public IP
+      - name: Get IP
         run: |
-          aws ec2 wait instance-running --instance-ids ${{ env.INSTANCE_ID }} --region ${{ env.AWS_REGION }}
-          PUBLIC_IP=$(aws ec2 describe-instances --instance-ids ${{ env.INSTANCE_ID }} --query 'Reservations[].Instances[].PublicIpAddress' --output text --region ${{ env.AWS_REGION }})
-          echo "PUBLIC_IP=$PUBLIC_IP" >> $GITHUB_ENV
+          aws ec2 wait instance-running --instance-ids ${{ env.INSTANCE_ID }}
+          IP=$(aws ec2 describe-instances --instance-ids ${{ env.INSTANCE_ID }} \
+            --query 'Reservations[].Instances[].PublicIpAddress' --output text)
+          echo "PUBLIC_IP=$IP" >> $GITHUB_ENV
 
-      - name: Success
+      - name: Done
         run: |
-          echo "DEPLOYED!"
+          echo "LISTO!"
           echo "URL: http://${{ env.PUBLIC_IP }}"
