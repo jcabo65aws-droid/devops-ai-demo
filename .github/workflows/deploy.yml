@@ -12,7 +12,6 @@ jobs:
       ECR_REPO: devops-ai-demo
       INSTANCE_NAME: github-devops-instance
       IMAGE_TAG: ${{ github.sha }}
-      # Mueve AWS_REGION aquí para usarlo en todo el job
       AWS_REGION: us-east-1
 
     steps:
@@ -24,8 +23,7 @@ jobs:
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          # Usa el valor directamente o desde vars
-          aws-region: ${{ env.AWS_REGION }}  # CORRECTO aquí
+          aws-region: ${{ env.AWS_REGION }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -37,7 +35,6 @@ jobs:
       - name: Create ECR Repository if not exists
         run: |
           if ! aws ecr describe-repositories --repository-names ${{ env.ECR_REPO }} --region ${{ env.AWS_REGION }} >/dev/null 2>&1; then
-            echo "Creating ECR repo: ${{ env.ECR_REPO }}"
             aws ecr create-repository --repository-name ${{ env.ECR_REPO }} --region ${{ env.AWS_REGION }}
           fi
 
@@ -52,7 +49,7 @@ jobs:
           echo "IMAGE_URI=${{ env.IMAGE_URI }}" >> $GITHUB_ENV
 
       - name: AI Code Review (OpenAI)
-        if: ${{ secrets.OPENAI_API_KEY != '' }}
+        if: ${{ env.OPENAI_API_KEY != '' }}
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
@@ -62,17 +59,13 @@ jobs:
             -H "Content-Type: application/json" \
             -d '{
               "model": "gpt-4o-mini",
-              "messages": [{"role": "user", "content": "Review this Dockerfile:\n\n'"$CONTENT"'"}]
+              "messages": [{"role": "user", "content": "Review this Dockerfile for security and best practices:\n\n'"$CONTENT"'"}]
             }' | jq -r '.choices[0].message.content'
 
       - name: Launch EC2 Instance
         id: ec2
         run: |
-          AMI_ID=$(aws ec2 describe-images \
-            --owners amazon \
-            --filters "Name=name,Values=amzn2-ami-hvm-*-x86_64-gp2" "Name=state,Values=available" \
-            --query 'Images | sort_by(@, &CreationDate) | [-1].ImageId' \
-            --output text --region ${{ env.AWS_REGION }})
+          AMI_ID=$(aws ec2 describe-images --owners amazon --filters "Name=name,Values=amzn2-ami-hvm-*-x86_64-gp2" "Name=state,Values=available" --query 'Images | sort_by(@, &CreationDate) | [-1].ImageId' --output text --region ${{ env.AWS_REGION }})
 
           INSTANCE_ID=$(aws ec2 run-instances \
             --image-id $AMI_ID \
@@ -100,12 +93,8 @@ jobs:
       - name: Wait & Get Public IP
         run: |
           aws ec2 wait instance-running --instance-ids ${{ env.INSTANCE_ID }} --region ${{ env.AWS_REGION }}
-          PUBLIC_IP=$(aws ec2 describe-instances \
-            --instance-ids ${{ env.INSTANCE_ID }} \
-            --query 'Reservations[].Instances[].PublicIpAddress' \
-            --output text --region ${{ env.AWS_REGION }})
+          PUBLIC_IP=$(aws ec2 describe-instances --instance-ids ${{ env.INSTANCE_ID }} --query 'Reservations[].Instances[].PublicIpAddress' --output text --region ${{ env.AWS_REGION }})
           echo "PUBLIC_IP=$PUBLIC_IP" >> $GITHUB_ENV
-          echo "Visit: http://$PUBLIC_IP"
 
       - name: Success
         run: |
