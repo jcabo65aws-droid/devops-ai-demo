@@ -23,21 +23,30 @@ jobs:
     # -------------------------
     # 1) AI Code Review (optional)
     # -------------------------
-    - name: AI Code Review (OpenAI)
+        - name: AI Code Review (OpenAI)
       if: ${{ secrets.OPENAI_API_KEY != '' }}
       run: |
-        echo "Gathering files for AI review..."
-        # Concatenate important files (Dockerfile + small tree)
-        tar -czf /tmp/repo.tgz Dockerfile html || true
-        # Build a small prompt with content (truncated to avoid huge payloads)
-        DOCKER_FILE_CONTENT=$(sed -n '1,200p' Dockerfile || true)
-        PROMPT="You are a senior DevOps engineer. Review the project's Dockerfile and html for security, best practices and deployment issues. Provide succinct suggestions and any required changes.\n\nDockerfile:\n$DOCKER_FILE_CONTENT"
-        echo "Prompt to AI:"
-        echo "$PROMPT"
+        echo "Running AI Code Review..."
+        DOCKER_FILE_CONTENT=$(sed -n '1,100p' Dockerfile || echo "No Dockerfile")
+        PROMPT=$(echo "You are a senior DevOps engineer. Review the following Dockerfile for best practices, security issues, and suggestions:\n\n$DOCKER_FILE_CONTENT")
+
+        JSON=$(jq -n --arg prompt "$PROMPT" '{
+          model: "gpt-5",
+          messages: [
+            {"role": "system", "content": "You are a helpful senior DevOps engineer."},
+            {"role": "user", "content": $prompt}
+          ],
+          max_tokens: 400
+        }')
+
         RESPONSE=$(curl -s https://api.openai.com/v1/chat/completions \
           -H "Content-Type: application/json" \
           -H "Authorization: Bearer ${{ secrets.OPENAI_API_KEY }}" \
-          -d @- <<'EOF' 
+          -d "$JSON")
+
+        echo "---- AI Review Result ----"
+        echo "$RESPONSE" | jq -r '.choices[0].message.content' || echo "(no output)"
+
 {
   "model": "gpt-5",
   "messages":[
