@@ -43,12 +43,16 @@ jobs:
           docker push ${{ env.IMAGE_URI }}
           echo "IMAGE_URI=${{ env.IMAGE_URI }}" >> $GITHUB_ENV
 
-      # 5️⃣ Revisión con IA (opcional)
+      # 5️⃣ Revisión con IA (sin if)
       - name: AI Review (optional)
-        if: ${{ secrets.OPENAI_API_KEY != '' }}
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
+          if [ -z "$OPENAI_API_KEY" ]; then
+            echo "⚠️  No OpenAI API key set. Skipping AI analysis."
+            exit 0
+          fi
+
           echo "🤖 Running AI Review..."
           curl -s https://api.openai.com/v1/chat/completions \
             -H "Authorization: Bearer $OPENAI_API_KEY" \
@@ -61,13 +65,11 @@ jobs:
         run: |
           echo "🚀 Launching EC2 instance..."
 
-          # Obtener la última AMI Amazon Linux 2
           AMI=$(aws ec2 describe-images --owners amazon \
             --filters "Name=name,Values=amzn2-ami-hvm-*-x86_64-gp2" "Name=state,Values=available" \
             --query 'Images | sort_by(@, &CreationDate) | [-1].ImageId' \
             --output text)
 
-          # Obtener automáticamente la primera Subnet y Security Group disponibles
           SUBNET_ID=$(aws ec2 describe-subnets \
             --query 'Subnets[0].SubnetId' --output text --region ${{ env.AWS_REGION }})
 
@@ -77,7 +79,6 @@ jobs:
           echo "📦 Using Subnet: $SUBNET_ID"
           echo "🛡️  Using Security Group: $SECURITY_GROUP_ID"
 
-          # Crear script de inicio (user data)
           printf '%s\n' \
             '#!/bin/bash' \
             'yum update -y' \
@@ -89,7 +90,6 @@ jobs:
             'docker pull '"${{ env.IMAGE_URI }}"'' \
             'docker run -d -p 80:80 '"${{ env.IMAGE_URI }}"'' > user-data.sh
 
-          # Crear instancia EC2
           INSTANCE_ID=$(aws ec2 run-instances \
             --image-id "$AMI" \
             --instance-type t3.micro \
