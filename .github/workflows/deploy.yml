@@ -14,22 +14,35 @@ jobs:
       INSTANCE_NAME: github-devops-instance
 
     steps:
+      # 1️⃣ Descarga el código del repositorio
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # 2️⃣ Configura las credenciales de AWS
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # 3️⃣ Configura Docker Buildx
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      # 4️⃣ Login en ECR
       - name: Log in to Amazon ECR
         run: |
-          echo "Logging in to Amazon ECR..."
+          echo "🔑 Logging in to Amazon ECR..."
           aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin ${{ env.ECR_REPO }}.dkr.ecr.$AWS_REGION.amazonaws.com
 
+      # 5️⃣ Construye la imagen Docker
       - name: Build Docker image
         run: |
-          echo "Building Docker image..."
+          echo "🐳 Building Docker image..."
           docker build -t $ECR_REPO:latest .
 
+      # 6️⃣ Análisis de código con IA (OpenAI)
       - name: AI Code Review (OpenAI)
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -39,7 +52,7 @@ jobs:
             exit 0
           fi
 
-          echo "🧠 Running AI Code Review..."
+          echo "🤖 Running AI Code Review..."
           DOCKER_FILE_CONTENT=$(sed -n '1,100p' Dockerfile || echo "No Dockerfile found.")
           PROMPT=$(echo "You are a senior DevOps engineer. Review this Dockerfile for best practices, security issues, and improvement suggestions:\n\n$DOCKER_FILE_CONTENT")
 
@@ -57,22 +70,61 @@ jobs:
             -H "Authorization: Bearer $OPENAI_API_KEY" \
             -d "$JSON" | jq -r '.choices[0].message.content'
 
+      # 7️⃣ Crea una instancia EC2
       - name: Deploy to EC2
         run: |
           echo "🚀 Creating EC2 instance..."
           AMI_ID=ami-0c94855ba95c71c99   # Amazon Linux 2 (us-east-1)
           INSTANCE_TYPE=t2.micro
           KEY_NAME=MyKeyPair
-          SECURITY_GROUP_ID=sg-0123456789abcdef0  # <--- reemplaza por tu SG real
-          SUBNET_ID=subnet-0123456789abcdef0      # <--- reemplaza por tu Subnet real
+          SECURITY_GROUP_ID=sg-0123456789abcdef0  # <-- reemplaza por tu SG real
+          SUBNET_ID=subnet-0123456789abcdef0      # <-- reemplaza por tu Subnet real
 
-          aws ec2 run-instances \
+          INSTANCE_ID=$(aws ec2 run-instances \
             --image-id $AMI_ID \
             --instance-type $INSTANCE_TYPE \
             --key-name $KEY_NAME \
             --security-group-ids $SECURITY_GROUP_ID \
             --subnet-id $SUBNET_ID \
             --region $AWS_REGION \
-            --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${INSTANCE_NAME}}]"
+            --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${INSTANCE_NAME}}]" \
+            --query "Instances[0].InstanceId" \
+            --output text)
 
-          echo "✅ EC2 instance creation requested successfully."
+          echo "✅ EC2 instance created: $INSTANCE_ID"
+
+          echo "INSTANCE_ID=$INSTANCE_ID" >> $GITHUB_ENV
+
+      # 8️⃣ Espera y despliega el contenedor automáticamente
+      - name: Configure and deploy container on EC2
+        env:
+          AWS_REGION: ${{ env.AWS_REGION }}
+          INSTANCE_NAME: ${{ env.INSTANCE_NAME }}
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+        run: |
+          echo "⚙️ Waiting for EC2 instance to be ready..."
+          INSTANCE_ID=${INSTANCE_ID:-$(aws ec2 describe-instances --filters "Name=tag:Name,Values=${INSTANCE_NAME}" \
+            --query "Reservations[].Instances[].InstanceId" --output text --region $AWS_REGION)}
+
+          aws ec2 wait instance-running --instance-ids $INSTANCE_ID --region $AWS_REGION
+          echo "✅ EC2 instance is now running."
+
+          PUBLIC_IP=$(aws ec2 describe-instances --instance-ids $INSTANCE_ID \
+            --query "Reservations[].Instances[].PublicIpAddress" --output text --region $AWS_REGION)
+          echo "🌍 Public IP: $PUBLIC_IP"
+
+          echo "🗝️ Creating temporary SSH key file..."
+          echo "$EC2_SSH_KEY" > MyKeyPair.pem
+          chmod 400 MyKeyPair.pem
+
+          echo "🔧 Installing Docker and starting container..."
+          ssh -o StrictHostKeyChecking=no -i MyKeyPair.pem ec2-user@$PUBLIC_IP << 'EOF'
+            sudo yum update -y
+            sudo yum install docker -y
+            sudo systemctl start docker
+            sudo systemctl enable docker
+            docker run -d -p 80:80 nginx:stable
+          EOF
+
+          echo "✅ Container deployed successfully on EC2."
+          echo "🌐 Visit: http://$PUBLIC_IP"
