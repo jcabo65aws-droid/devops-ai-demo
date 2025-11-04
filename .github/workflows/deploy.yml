@@ -9,10 +9,11 @@ jobs:
   build_and_deploy:
     runs-on: ubuntu-latest
     env:
+      AWS_REGION: us-east-1
+      AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
       ECR_REPO: devops-ai-demo
       INSTANCE_NAME: github-devops-instance
       IMAGE_TAG: ${{ github.sha }}
-      AWS_REGION: us-east-1
 
     steps:
       - name: Checkout code
@@ -32,13 +33,13 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Create ECR Repository if not exists
+      - name: Create ECR Repository
         run: |
           if ! aws ecr describe-repositories --repository-names ${{ env.ECR_REPO }} --region ${{ env.AWS_REGION }} >/dev/null 2>&1; then
             aws ecr create-repository --repository-name ${{ env.ECR_REPO }} --region ${{ env.AWS_REGION }}
           fi
 
-      - name: Build, tag, and push image to ECR
+      - name: Build & Push to ECR
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_URI: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ env.IMAGE_TAG }}
@@ -48,7 +49,7 @@ jobs:
           docker push ${{ env.IMAGE_URI }}
           echo "IMAGE_URI=${{ env.IMAGE_URI }}" >> $GITHUB_ENV
 
-      - name: AI Code Review (OpenAI)
+      - name: AI Code Review
         if: ${{ env.OPENAI_API_KEY != '' }}
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -59,38 +60,52 @@ jobs:
             -H "Content-Type: application/json" \
             -d '{
               "model": "gpt-4o-mini",
-              "messages": [{"role": "user", "content": "Review this Dockerfile for security and best practices:\n\n'"$CONTENT"'"}]
+              "messages": [{"role": "user", "content": "Review this Dockerfile:\n\n'"$CONTENT"'"}]
             }' | jq -r '.choices[0].message.content'
 
-      - name: Launch EC2 Instance
+      - name: Launch EC2
         id: ec2
         run: |
-          AMI_ID=$(aws ec2 describe-images --owners amazon --filters "Name=name,Values=amzn2-ami-hvm-*-x86_64-gp2" "Name=state,Values=available" --query 'Images | sort_by(@, &CreationDate) | [-1].ImageId' --output text --region ${{ env.AWS_REGION }})
+          AMI_ID=$(aws ec2 describe-images \
+            --owners amazon \
+            --filters "Name=name,Values=amzn2-ami-hvm-*-x86_64-gp2" "Name=state,Values=available" \
+            --query 'Images | sort_by(@, &CreationDate) | [-1].ImageId' \
+            --output text --region ${{ env.AWS_REGION }})
+
+          if [ -z "${{ vars.SUBNET_ID }}" ] || [ -z "${{ vars.SECURITY_GROUP_ID }}" ]; then
+            echo "ERROR: Set SUBNET_ID and SECURITY_GROUP_ID in GitHub Variables!"
+            exit 1
+          fi
+
+          USER_DATA=$(cat << 'EOF'
+#!/bin/bash
+yum update -y
+yum install -y docker
+systemctl start docker
+systemctl enable docker
+usermod -aG docker ec2-user
+$(aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com)
+docker pull ${{ env.IMAGE_URI }}
+docker run -d -p 80:80 ${{ env.IMAGE_URI }}
+EOF
+)
 
           INSTANCE_ID=$(aws ec2 run-instances \
-            --image-id $AMI_ID \
-            --count 1 \
+            --image-id "$AMI_ID" \
             --instance-type t3.micro \
             --key-name MyKeyPair \
             --security-group-ids ${{ vars.SECURITY_GROUP_ID }} \
             --subnet-id ${{ vars.SUBNET_ID }} \
             --iam-instance-profile Name=EC2ECRAccessRole \
-            --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=${{ env.INSTANCE_NAME }}}]' \
-            --user-data '#!/bin/bash
-              yum update -y
-              yum install -y docker
-              systemctl start docker
-              systemctl enable docker
-              usermod -aG docker ec2-user
-              $(aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ steps.login-ecr.outputs.registry }})
-              docker pull ${{ env.IMAGE_URI }}
-              docker run -d -p 80:80 ${{ env.IMAGE_URI }}' \
+            --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${{ env.INSTANCE_NAME }}}]" \
+            --user-data "$USER_DATA" \
             --query 'Instances[0].InstanceId' \
-            --output text)
+            --output text \
+            --region ${{ env.AWS_REGION }})
 
           echo "INSTANCE_ID=$INSTANCE_ID" >> $GITHUB_ENV
 
-      - name: Wait & Get Public IP
+      - name: Get Public IP
         run: |
           aws ec2 wait instance-running --instance-ids ${{ env.INSTANCE_ID }} --region ${{ env.AWS_REGION }}
           PUBLIC_IP=$(aws ec2 describe-instances --instance-ids ${{ env.INSTANCE_ID }} --query 'Reservations[].Instances[].PublicIpAddress' --output text --region ${{ env.AWS_REGION }})
@@ -98,5 +113,5 @@ jobs:
 
       - name: Success
         run: |
-          echo "Deployed!"
+          echo "DEPLOYED!"
           echo "URL: http://${{ env.PUBLIC_IP }}"
