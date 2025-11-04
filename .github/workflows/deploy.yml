@@ -31,11 +31,17 @@ jobs:
           docker build -t $ECR_REPO:latest .
 
       - name: AI Code Review (OpenAI)
-        if: ${{ secrets.OPENAI_API_KEY != '' }}
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
-          echo "Running AI Code Review..."
-          DOCKER_FILE_CONTENT=$(sed -n '1,100p' Dockerfile || echo "No Dockerfile")
-          PROMPT=$(echo "You are a senior DevOps engineer. Review the following Dockerfile for best practices, security issues, and improvement tips:\n\n$DOCKER_FILE_CONTENT")
+          if [ -z "$OPENAI_API_KEY" ]; then
+            echo "⚠️  No OpenAI API key provided, skipping AI analysis."
+            exit 0
+          fi
+
+          echo "🧠 Running AI Code Review..."
+          DOCKER_FILE_CONTENT=$(sed -n '1,100p' Dockerfile || echo "No Dockerfile found.")
+          PROMPT=$(echo "You are a senior DevOps engineer. Review this Dockerfile for best practices, security issues, and improvement suggestions:\n\n$DOCKER_FILE_CONTENT")
 
           JSON=$(jq -n --arg prompt "$PROMPT" '{
             model: "gpt-4o-mini",
@@ -48,20 +54,18 @@ jobs:
 
           curl -s https://api.openai.com/v1/chat/completions \
             -H "Content-Type: application/json" \
-            -H "Authorization: Bearer ${{ secrets.OPENAI_API_KEY }}" \
+            -H "Authorization: Bearer $OPENAI_API_KEY" \
             -d "$JSON" | jq -r '.choices[0].message.content'
 
       - name: Deploy to EC2
         run: |
-          echo "Creating EC2 instance..."
-          # ⚙️ Reemplaza estos valores con los tuyos de AWS
+          echo "🚀 Creating EC2 instance..."
           AMI_ID=ami-0c94855ba95c71c99   # Amazon Linux 2 (us-east-1)
           INSTANCE_TYPE=t2.micro
           KEY_NAME=MyKeyPair
-          SECURITY_GROUP_ID=sg-0123456789abcdef0  # ← coloca aquí tu Security Group ID real
-          SUBNET_ID=subnet-0123456789abcdef0      # ← coloca aquí tu Subnet ID real
+          SECURITY_GROUP_ID=sg-0123456789abcdef0  # <--- reemplaza por tu SG real
+          SUBNET_ID=subnet-0123456789abcdef0      # <--- reemplaza por tu Subnet real
 
-          # Crear la instancia EC2
           aws ec2 run-instances \
             --image-id $AMI_ID \
             --instance-type $INSTANCE_TYPE \
