@@ -1,63 +1,224 @@
-name: CI/CD AWS Free Tier
+name: CI -> ECR -> Create EC2 -> Deploy (with AI review)
 
 on:
   push:
     branches: [ main ]
 
-jobs:
-  build-deploy:
-    runs-on: ubuntu-latest
+permissions:
+  contents: read
+  id-token: write
+  actions: write
 
+jobs:
+  build_and_deploy:
+    runs-on: ubuntu-latest
     env:
-      ECR_REPOSITORY: myapp
-      AWS_REGION: ${{ secrets.AWS_REGION }}
+      ECR_REPO: devops-ai-demo
+      INSTANCE_NAME: github-devops-instance
 
     steps:
-    - name: Checkout code
+    - name: Checkout repo
       uses: actions/checkout@v4
 
+    # -------------------------
+    # 1) AI Code Review (optional)
+    # -------------------------
+    - name: AI Code Review (OpenAI)
+      if: ${{ secrets.OPENAI_API_KEY != '' }}
+      run: |
+        echo "Gathering files for AI review..."
+        # Concatenate important files (Dockerfile + small tree)
+        tar -czf /tmp/repo.tgz Dockerfile html || true
+        # Build a small prompt with content (truncated to avoid huge payloads)
+        DOCKER_FILE_CONTENT=$(sed -n '1,200p' Dockerfile || true)
+        PROMPT="You are a senior DevOps engineer. Review the project's Dockerfile and html for security, best practices and deployment issues. Provide succinct suggestions and any required changes.\n\nDockerfile:\n$DOCKER_FILE_CONTENT"
+        echo "Prompt to AI:"
+        echo "$PROMPT"
+        RESPONSE=$(curl -s https://api.openai.com/v1/chat/completions \
+          -H "Content-Type: application/json" \
+          -H "Authorization: Bearer ${{ secrets.OPENAI_API_KEY }}" \
+          -d @- <<'EOF' 
+{
+  "model": "gpt-5",
+  "messages":[
+    {"role":"system","content":"You are a helpful senior DevOps engineer."},
+    {"role":"user","content":"${PROMPT}"}
+  ],
+  "max_tokens":600
+}
+EOF
+)
+        echo "---- AI Review Result ----"
+        echo $RESPONSE | jq -r '.choices[0].message.content' || echo "(no output)"
+
+    # -------------------------
+    # 2) Configure AWS credentials
+    # -------------------------
     - name: Configure AWS credentials
-      uses: aws-actions/configure-aws-credentials@v4
+      uses: aws-actions/configure-aws-credentials@v3
       with:
         aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region: ${{ secrets.AWS_REGION }}
 
+    # -------------------------
+    # 3) Create ECR repo (if missing)
+    # -------------------------
+    - name: Ensure ECR repository exists
+      run: |
+        aws ecr describe-repositories --repository-names "${ECR_REPO}" || \
+        aws ecr create-repository --repository-name "${ECR_REPO}"
+
+    # -------------------------
+    # 4) Build & push Docker image to ECR
+    # -------------------------
     - name: Login to ECR
-      id: login-ecr
       uses: aws-actions/amazon-ecr-login@v2
 
-    # 👇👇 AQUI PEGAS TU BLOQUE DE IA 👇👇
-    - name: AI Code Review
-      run: |
-        echo "Running AI analysis..."
-        curl -s https://api.openai.com/v1/chat/completions \
-          -H "Content-Type: application/json" \
-          -H "Authorization: Bearer ${{ secrets.OPENAI_API_KEY }}" \
-          -d '{
-            "model": "gpt-5",
-            "messages": [{"role": "user", "content": "Review this Dockerfile for best practices"}]
-          }' | jq -r '.choices[0].message.content'
-
-    # 👆👆 PEGA ESTO ANTES DE BUILD 👆👆
-
-    - name: Build, tag, and push Docker image
+    - name: Build and push Docker image to ECR
       uses: docker/build-push-action@v5
       with:
         context: .
         push: true
-        tags: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:latest
+        tags: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:latest
 
-    - name: Deploy to EC2
-      uses: appleboy/ssh-action@master
+    - name: Set REPO_URI output
+      run: echo "REPO_URI=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}" >> $GITHUB_OUTPUT
+
+    # -------------------------
+    # 5) Create key pair and upload private key as artifact
+    # -------------------------
+    - name: Create EC2 KeyPair and save private key
+      id: create_key
+      run: |
+        KEY_NAME=github-devops-key-${{ github.run_id }}
+        echo "Creating key pair: $KEY_NAME"
+        aws ec2 create-key-pair --key-name $KEY_NAME --query 'KeyMaterial' --output text > private_key.pem
+        chmod 600 private_key.pem
+        echo "KEY_NAME=$KEY_NAME" >> $GITHUB_OUTPUT
+
+    - name: Upload private key as artifact
+      uses: actions/upload-artifact@v4
       with:
-        host: ${{ secrets.EC2_HOST }}
-        username: ec2-user
-        key: ${{ secrets.EC2_SSH_KEY }}
-        script: |
-          AWS_REGION=${{ secrets.AWS_REGION }}
-          REPO_URI=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}
-          docker rm -f myapp || true
-          $(aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $REPO_URI)
-          docker pull $REPO_URI:latest
-          docker run -d --name myapp -p 80:80 $REPO_URI:latest
+        name: ec2-private-key
+        path: private_key.pem
+
+    # -------------------------
+    # 6) Create Security Group (allow SSH & HTTP)
+    # -------------------------
+    - name: Create security group
+      id: create_sg
+      run: |
+        VPC_ID=$(aws ec2 describe-vpcs --filters Name=isDefault,Values=true --query "Vpcs[0].VpcId" --output text)
+        if [ -z "$VPC_ID" ] || [ "$VPC_ID" == "None" ]; then
+          VPC_ID=$(aws ec2 describe-vpcs --query "Vpcs[0].VpcId" --output text)
+        fi
+        SG_NAME=sg-github-devops-${{ github.run_id }}
+        SG_ID=$(aws ec2 create-security-group --group-name $SG_NAME --description "SSH+HTTP for devops-demo" --vpc-id $VPC_ID --query 'GroupId' --output text)
+        aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 22 --cidr 0.0.0.0/0
+        aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 80 --cidr 0.0.0.0/0
+        echo "SG_ID=$SG_ID" >> $GITHUB_OUTPUT
+
+    # -------------------------
+    # 7) Create IAM role & instance profile for EC2 to read ECR + SSM
+    # -------------------------
+    - name: Create IAM Role and Instance Profile
+      id: create_role
+      run: |
+        ROLE_NAME=ec2-ecr-ssm-role-${{ github.run_id }}
+        TRUST_POLICY='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+        echo $TRUST_POLICY > trust.json
+        aws iam create-role --role-name $ROLE_NAME --assume-role-policy-document file://trust.json || true
+        aws iam attach-role-policy --role-name $ROLE_NAME --policy-arn arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly || true
+        aws iam attach-role-policy --role-name $ROLE_NAME --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore || true
+        aws iam create-instance-profile --instance-profile-name $ROLE_NAME || true
+        aws iam add-role-to-instance-profile --instance-profile-name $ROLE_NAME --role-name $ROLE_NAME || true
+        echo "ROLE_NAME=$ROLE_NAME" >> $GITHUB_OUTPUT
+
+    # -------------------------
+    # 8) Get latest Amazon Linux 2 AMI via SSM
+    # -------------------------
+    - name: Resolve AMI
+      id: ami
+      run: |
+        AMI_ID=$(aws ssm get-parameter --name /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2 --query "Parameter.Value" --output text)
+        echo "AMI_ID=$AMI_ID" >> $GITHUB_OUTPUT
+
+    # -------------------------
+    # 9) Launch EC2 instance with user-data to install docker and deploy image
+    # -------------------------
+    - name: Launch EC2 instance
+      id: launch
+      run: |
+        KEY_NAME=${{ steps.create_key.outputs.KEY_NAME }}
+        SG_ID=${{ steps.create_sg.outputs.SG_ID }}
+        ROLE_NAME=${{ steps.create_role.outputs.ROLE_NAME }}
+        AMI_ID=${{ steps.ami.outputs.AMI_ID }}
+        INSTANCE_TYPE=t2.micro
+
+        REPO_URI=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}
+
+        # user-data: install docker, login to ECR via IAM role and run container
+        read -r -d '' USER_DATA <<'EOF'
+#!/bin/bash
+set -e
+yum update -y || apt-get update -y
+# Install docker (try yum first, fallback to apt)
+if command -v yum >/dev/null 2>&1; then
+  yum install -y docker
+  systemctl enable docker
+  systemctl start docker
+else
+  apt-get install -y docker.io
+  systemctl enable docker
+  systemctl start docker
+fi
+# Install AWS CLI v2 if not present
+if ! command -v aws >/dev/null 2>&1; then
+  curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+  unzip /tmp/awscliv2.zip -d /tmp
+  /tmp/aws/install -i /tmp/aws -b /usr/local/bin
+fi
+# Wait until instance profile credentials available
+sleep 10
+REPO_URI_PLACEHOLDER="__REPO_URI__"
+aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${REPO_URI_PLACEHOLDER}
+docker pull ${REPO_URI_PLACEHOLDER}:latest || true
+docker rm -f myapp || true
+docker run -d --name myapp -p 80:80 ${REPO_URI_PLACEHOLDER}:latest || true
+EOF
+
+        # inject real repo uri & region into user-data
+        USER_DATA="${USER_DATA//__REPO_URI__/${REPO_URI}}"
+        USER_DATA="${USER_DATA//\${AWS_REGION}/${{ secrets.AWS_REGION }}}"
+
+        INSTANCE_ID=$(aws ec2 run-instances --image-id $AMI_ID --instance-type $INSTANCE_TYPE --key-name $KEY_NAME --security-group-ids $SG_ID --iam-instance-profile Name=$ROLE_NAME --user-data "$USER_DATA" --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${INSTANCE_NAME}}]" --query "Instances[0].InstanceId" --output text)
+        echo "INSTANCE_ID=$INSTANCE_ID" >> $GITHUB_OUTPUT
+
+    # -------------------------
+    # 10) Wait for instance and get Public IP
+    # -------------------------
+    - name: Wait for instance and get IP
+      run: |
+        INSTANCE_ID=${{ steps.launch.outputs.INSTANCE_ID }}
+        echo "Waiting instance $INSTANCE_ID..."
+        aws ec2 wait instance-status-ok --instance-ids $INSTANCE_ID
+        IP=$(aws ec2 describe-instances --instance-ids $INSTANCE_ID --query "Reservations[0].Instances[0].PublicIpAddress" --output text)
+        echo "PUBLIC_IP=$IP" > instance_info.txt
+        echo "PUBLIC_IP=$IP" >> $GITHUB_OUTPUT
+
+    - name: Upload instance IP as artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: ec2-info
+        path: instance_info.txt
+
+    # -------------------------
+    # 11) Trigger remote pull via SSM to ensure latest image running
+    # -------------------------
+    - name: Ensure latest image running via SSM
+      run: |
+        INSTANCE_ID=${{ steps.launch.outputs.INSTANCE_ID }}
+        REGION=${{ secrets.AWS_REGION }}
+        REPO_URI=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}
+        aws ssm send-command --instance-ids $INSTANCE_ID --document-name "AWS-RunShellScript" --comment "Pull & run latest image" --parameters commands=["$(aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $REPO_URI)","docker pull $REPO_URI:latest","docker rm -f myapp || true","docker run -d --name myapp -p 80:80 $REPO_URI:latest"] --region $REGION
