@@ -11,6 +11,7 @@ jobs:
     env:
       ECR_REPO: devops-ai-demo
       INSTANCE_NAME: github-devops-instance
+      AWS_REGION: us-east-1
 
     steps:
       - name: Checkout code
@@ -19,26 +20,77 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to Amazon ECR
-        env:
-          AWS_REGION: us-east-1
-        run: |
-          aws --version
-          echo "Logging in to ECR..."
-          aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin ${{ env.ECR_REPO }}.dkr.ecr.$AWS_REGION.amazonaws.com
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
 
       - name: Build Docker image
         run: |
           docker build -t $ECR_REPO:latest .
 
       - name: AI Code Review (OpenAI)
-        if: ${{ secrets.OPENAI_API_KEY != '' }}
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
+          if [ -z "$OPENAI_API_KEY" ]; then
+            echo "⚠️ No OPENAI_API_KEY found in GitHub Secrets, skipping AI analysis."
+            exit 0
+          fi
+
           echo "Running AI Code Review..."
           DOCKER_FILE_CONTENT=$(sed -n '1,100p' Dockerfile || echo "No Dockerfile")
-          PROMPT=$(echo "You are a senior DevOps engineer. Review the following Dockerfile for best practices, security issues, and suggestions:\n\n$DOCKER_FILE_CONTENT")
+          PROMPT=$(echo "You are a senior DevOps engineer. Review this Dockerfile for security and optimization:\n\n$DOCKER_FILE_CONTENT")
 
           JSON=$(jq -n --arg prompt "$PROMPT" '{
             model: "gpt-5",
             messages: [
-              {"role": "system", "content": "
+              {"role": "system", "content": "You are a helpful senior DevOps engineer."},
+              {"role": "user", "content": $prompt}
+            ],
+            max_tokens: 400
+          }')
+
+          RESPONSE=$(curl -s https://api.openai.com/v1/chat/completions \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $OPENAI_API_KEY" \
+            -d "$JSON")
+
+          echo "---- AI Review Result ----"
+          echo "$RESPONSE" | jq -r '.choices[0].message.content' || echo "(no output)"
+
+      - name: Create EC2 Instance
+        run: |
+          echo "Creating EC2 instance..."
+          INSTANCE_ID=$(aws ec2 run-instances \
+            --image-id ami-0c02fb55956c7d316 \
+            --instance-type t2.micro \
+            --key-name default-key \
+            --security-group-ids sg-xxxxxxxx \
+            --subnet-id subnet-xxxxxxxx \
+            --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${INSTANCE_NAME}}]" \
+            --query 'Instances[0].InstanceId' \
+            --output text)
+
+          echo "INSTANCE_ID=$INSTANCE_ID" >> $GITHUB_ENV
+
+          echo "Waiting for EC2 to be ready..."
+          aws ec2 wait instance-status-ok --instance-ids $INSTANCE_ID
+
+          PUBLIC_IP=$(aws ec2 describe-instances \
+            --instance-ids $INSTANCE_ID \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' \
+            --output text)
+
+          echo "EC2 Public IP: $PUBLIC_IP"
+          echo "PUBLIC_IP=$PUBLIC_IP" >> $GITHUB_ENV
+
+      - name: Deploy App to EC2
+        run: |
+          echo "Deploying app to EC2 $PUBLIC_IP..."
+          ssh -o StrictHostKeyChecking=no ec2-user@$PUBLIC_IP "sudo yum install -y docker && sudo service docker start"
+          scp -o StrictHostKeyChecking=no Dockerfile ec2-user@$PUBLIC_IP:/home/ec2-user/
+          ssh ec2-user@$PUBLIC_IP "cd /home/ec2-user && sudo docker build -t myapp . && sudo docker run -d -p 80:80 myapp"
+          echo "✅ Deployment completed at http://$PUBLIC_IP"
