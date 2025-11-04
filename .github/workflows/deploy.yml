@@ -77,7 +77,7 @@ jobs:
             exit 1
           fi
 
-          USER_DATA=$(cat << 'EOF'
+          cat > user-data.sh << 'EOF'
 #!/bin/bash
 yum update -y
 yum install -y docker
@@ -88,7 +88,6 @@ $(aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --use
 docker pull ${{ env.IMAGE_URI }}
 docker run -d -p 80:80 ${{ env.IMAGE_URI }}
 EOF
-)
 
           INSTANCE_ID=$(aws ec2 run-instances \
             --image-id "$AMI_ID" \
@@ -98,7 +97,7 @@ EOF
             --subnet-id ${{ vars.SUBNET_ID }} \
             --iam-instance-profile Name=EC2ECRAccessRole \
             --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${{ env.INSTANCE_NAME }}}]" \
-            --user-data "$USER_DATA" \
+            --user-data file://user-data.sh \
             --query 'Instances[0].InstanceId' \
             --output text \
             --region ${{ env.AWS_REGION }})
