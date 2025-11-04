@@ -30,23 +30,26 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # 4️⃣ Login en ECR
-     - name: Ensure ECR repo exists and log in
-     run: |
-      echo "🔍 Checking if ECR repository exists..."
-      REPO_NAME=${{ env.ECR_REPO }}
-      REGION=${{ env.AWS_REGION }}
+      # 4️⃣ Crea el repositorio ECR si no existe y realiza el login
+      - name: Ensure ECR repo exists and log in
+        env:
+          ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+        run: |
+          echo "🔍 Checking if ECR repository exists..."
+          REPO_NAME=${{ env.ECR_REPO }}
+          REGION=${{ env.AWS_REGION }}
+          ACCOUNT_ID=${{ secrets.AWS_ACCOUNT_ID }}
 
-      if ! aws ecr describe-repositories --repository-names "$REPO_NAME" --region "$REGION" >/dev/null 2>&1; then
-        echo "🪄 Repository not found. Creating ECR repository: $REPO_NAME ..."
-        aws ecr create-repository --repository-name "$REPO_NAME" --region "$REGION"
-        echo "✅ Repository created successfully."
-      else
-       echo "✅ Repository already exists."
-      fi
+          if ! aws ecr describe-repositories --repository-names "$REPO_NAME" --region "$REGION" >/dev/null 2>&1; then
+            echo "🪄 Repository not found. Creating ECR repository: $REPO_NAME ..."
+            aws ecr create-repository --repository-name "$REPO_NAME" --region "$REGION"
+            echo "✅ Repository created successfully."
+          else
+            echo "✅ Repository already exists."
+          fi
 
-      echo "🔑 Logging in to Amazon ECR..."
-      aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com"
+          echo "🔑 Logging in to Amazon ECR..."
+          aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com"
 
       # 5️⃣ Construye la imagen Docker
       - name: Build Docker image
@@ -89,8 +92,8 @@ jobs:
           AMI_ID=ami-0c94855ba95c71c99   # Amazon Linux 2 (us-east-1)
           INSTANCE_TYPE=t2.micro
           KEY_NAME=MyKeyPair
-          SECURITY_GROUP_ID=sg-0123456789abcdef0  # <-- reemplaza por tu SG real
-          SUBNET_ID=subnet-0123456789abcdef0      # <-- reemplaza por tu Subnet real
+          SECURITY_GROUP_ID=sg-0123456789abcdef0  # 🔹 reemplaza por tu SG real
+          SUBNET_ID=subnet-0123456789abcdef0      # 🔹 reemplaza por tu Subnet real
 
           INSTANCE_ID=$(aws ec2 run-instances \
             --image-id $AMI_ID \
@@ -104,7 +107,6 @@ jobs:
             --output text)
 
           echo "✅ EC2 instance created: $INSTANCE_ID"
-
           echo "INSTANCE_ID=$INSTANCE_ID" >> $GITHUB_ENV
 
       # 8️⃣ Espera y despliega el contenedor automáticamente
