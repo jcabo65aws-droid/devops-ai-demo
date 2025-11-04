@@ -38,11 +38,16 @@ jobs:
           docker push ${{ env.IMAGE_URI }}
           echo "IMAGE_URI=${{ env.IMAGE_URI }}" >> $GITHUB_ENV
 
-      - name: AI Review (opcional)
-        if: ${{ secrets.OPENAI_API_KEY != '' }}
+      - name: AI Review (optional)
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
+          if [ -z "$OPENAI_API_KEY" ]; then
+            echo "⚠️ No OpenAI API key found. Skipping AI review."
+            exit 0
+          fi
+
+          echo "🤖 Running AI review..."
           curl -s https://api.openai.com/v1/chat/completions \
             -H "Authorization: Bearer $OPENAI_API_KEY" \
             -H "Content-Type: application/json" \
@@ -50,19 +55,17 @@ jobs:
 
       - name: Launch EC2
         run: |
-          # AMI más reciente
+          echo "🚀 Launching EC2 instance..."
           AMI=$(aws ec2 describe-images --owners amazon \
             --filters "Name=name,Values=amzn2-ami-hvm-*-x86_64-gp2" "Name=state,Values=available" \
             --query 'Images | sort_by(@, &CreationDate) | [-1].ImageId' \
             --output text)
 
-          # Validar variables
           if [ -z "${{ vars.SUBNET_ID }}" ] || [ -z "${{ vars.SECURITY_GROUP_ID }}" ]; then
-            echo "ERROR: Set SUBNET_ID and SECURITY_GROUP_ID in GitHub Variables"
+            echo "❌ ERROR: Define SUBNET_ID and SECURITY_GROUP_ID in GitHub Variables."
             exit 1
           fi
 
-          # User data (sin heredoc problemático)
           printf '%s\n' \
             '#!/bin/bash' \
             'yum update -y' \
@@ -70,11 +73,10 @@ jobs:
             'systemctl start docker' \
             'systemctl enable docker' \
             'usermod -aG docker ec2-user' \
-            'aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com' \
-            'docker pull ${{ env.IMAGE_URI }}' \
-            'docker run -d -p 80:80 ${{ env.IMAGE_URI }}' > user-data.sh
+            "aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com" \
+            "docker pull ${{ env.IMAGE_URI }}" \
+            "docker run -d -p 80:80 ${{ env.IMAGE_URI }}" > user-data.sh
 
-          # Lanzar EC2
           ID=$(aws ec2 run-instances \
             --image-id "$AMI" \
             --instance-type t3.micro \
@@ -97,5 +99,5 @@ jobs:
 
       - name: Done
         run: |
-          echo "LISTO!"
-          echo "URL: http://${{ env.PUBLIC_IP }}"
+          echo "✅ Deployment complete!"
+          echo "🌐 Visit: http://${{ env.PUBLIC_IP }}"
