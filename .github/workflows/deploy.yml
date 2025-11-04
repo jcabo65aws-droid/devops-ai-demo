@@ -27,6 +27,20 @@ jobs:
       id: login-ecr
       uses: aws-actions/amazon-ecr-login@v2
 
+    # 👇👇 AQUI PEGAS TU BLOQUE DE IA 👇👇
+    - name: AI Code Review
+      run: |
+        echo "Running AI analysis..."
+        curl -s https://api.openai.com/v1/chat/completions \
+          -H "Content-Type: application/json" \
+          -H "Authorization: Bearer ${{ secrets.OPENAI_API_KEY }}" \
+          -d '{
+            "model": "gpt-5",
+            "messages": [{"role": "user", "content": "Review this Dockerfile for best practices"}]
+          }' | jq -r '.choices[0].message.content'
+
+    # 👆👆 PEGA ESTO ANTES DE BUILD 👆👆
+
     - name: Build, tag, and push Docker image
       uses: docker/build-push-action@v5
       with:
