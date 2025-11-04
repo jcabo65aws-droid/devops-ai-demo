@@ -9,30 +9,27 @@ jobs:
   build_and_deploy:
     runs-on: ubuntu-latest
     env:
-      AWS_REGION: us-east-1
       ECR_REPO: devops-ai-demo
       INSTANCE_NAME: github-devops-instance
       IMAGE_TAG: ${{ github.sha }}
-      IMAGE_URI: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ github.sha }}
+      # Mueve AWS_REGION aquí para usarlo en todo el job
+      AWS_REGION: us-east-1
 
     steps:
-      # 1. Checkout
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # 2. AWS Credentials
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
+          # Usa el valor directamente o desde vars
+          aws-region: ${{ env.AWS_REGION }}  # CORRECTO aquí
 
-      # 3. Docker Buildx
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # 4. ECR Login + Create Repo
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
@@ -40,44 +37,34 @@ jobs:
       - name: Create ECR Repository if not exists
         run: |
           if ! aws ecr describe-repositories --repository-names ${{ env.ECR_REPO }} --region ${{ env.AWS_REGION }} >/dev/null 2>&1; then
-            echo "Creating ECR repository: ${{ env.ECR_REPO }}"
+            echo "Creating ECR repo: ${{ env.ECR_REPO }}"
             aws ecr create-repository --repository-name ${{ env.ECR_REPO }} --region ${{ env.AWS_REGION }}
-          else
-            echo "ECR repository already exists."
           fi
 
-      # 5. Build, Tag & Push Image to ECR
       - name: Build, tag, and push image to ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_URI: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ env.IMAGE_TAG }}
         run: |
-          echo "Building Docker image..."
           docker build -t ${{ env.ECR_REPO }} .
-          echo "Tagging image..."
           docker tag ${{ env.ECR_REPO }}:latest ${{ env.IMAGE_URI }}
-          echo "Pushing to ECR..."
           docker push ${{ env.IMAGE_URI }}
-          echo "Image pushed: ${{ env.IMAGE_URI }}"
+          echo "IMAGE_URI=${{ env.IMAGE_URI }}" >> $GITHUB_ENV
 
-      # 6. AI Code Review (OpenAI)
-      - name: AI Code Review
+      - name: AI Code Review (OpenAI)
+        if: ${{ secrets.OPENAI_API_KEY != '' }}
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
-          if [ -z "$OPENAI_API_KEY" ]; then
-            echo "No OpenAI key, skipping AI review."
-            exit 0
-          fi
-          DOCKER_CONTENT=$(cat Dockerfile)
-          PROMPT="Review this Dockerfile for security, best practices, and improvements:\n\n$DOCKER_CONTENT"
+          CONTENT=$(cat Dockerfile)
           curl -s https://api.openai.com/v1/chat/completions \
-            -H "Content-Type: application/json" \
             -H "Authorization: Bearer $OPENAI_API_KEY" \
+            -H "Content-Type: application/json" \
             -d '{
               "model": "gpt-4o-mini",
-              "messages": [{"role": "user", "content": "'"$PROMPT"'"}],
-              "max_tokens": 500
+              "messages": [{"role": "user", "content": "Review this Dockerfile:\n\n'"$CONTENT"'"}]
             }' | jq -r '.choices[0].message.content'
 
-      # 7. Launch EC2 (t3.micro, correct SG + Subnet)
       - name: Launch EC2 Instance
         id: ec2
         run: |
@@ -85,45 +72,42 @@ jobs:
             --owners amazon \
             --filters "Name=name,Values=amzn2-ami-hvm-*-x86_64-gp2" "Name=state,Values=available" \
             --query 'Images | sort_by(@, &CreationDate) | [-1].ImageId' \
-            --output text)
+            --output text --region ${{ env.AWS_REGION }})
 
           INSTANCE_ID=$(aws ec2 run-instances \
             --image-id $AMI_ID \
+            --count 1 \
             --instance-type t3.micro \
             --key-name MyKeyPair \
             --security-group-ids ${{ vars.SECURITY_GROUP_ID }} \
             --subnet-id ${{ vars.SUBNET_ID }} \
-            --iam-instance-profile Name=EC2ECRAccessRole \  # Necesario para pull ECR
-            --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${INSTANCE_NAME}}]" \
+            --iam-instance-profile Name=EC2ECRAccessRole \
+            --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=${{ env.INSTANCE_NAME }}}]' \
             --user-data '#!/bin/bash
               yum update -y
               yum install -y docker
-              service docker start
-              usermod -a -G docker ec2-user
-              $(aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com)
+              systemctl start docker
+              systemctl enable docker
+              usermod -aG docker ec2-user
+              $(aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ steps.login-ecr.outputs.registry }})
               docker pull ${{ env.IMAGE_URI }}
               docker run -d -p 80:80 ${{ env.IMAGE_URI }}' \
             --query 'Instances[0].InstanceId' \
             --output text)
 
           echo "INSTANCE_ID=$INSTANCE_ID" >> $GITHUB_ENV
-          echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
 
-      # 8. Wait for EC2 + Get Public IP
-      - name: Wait for EC2 and get IP
+      - name: Wait & Get Public IP
         run: |
-          aws ec2 wait instance-running --instance-ids ${{ env.INSTANCE_ID }}
+          aws ec2 wait instance-running --instance-ids ${{ env.INSTANCE_ID }} --region ${{ env.AWS_REGION }}
           PUBLIC_IP=$(aws ec2 describe-instances \
             --instance-ids ${{ env.INSTANCE_ID }} \
             --query 'Reservations[].Instances[].PublicIpAddress' \
-            --output text)
+            --output text --region ${{ env.AWS_REGION }})
           echo "PUBLIC_IP=$PUBLIC_IP" >> $GITHUB_ENV
           echo "Visit: http://$PUBLIC_IP"
 
-      # 9. Final Output
-      - name: Deployment Summary
+      - name: Success
         run: |
-          echo "Deployed successfully!"
-          echo "EC2 Instance: ${{ env.INSTANCE_ID }}"
-          echo "Public URL: http://${{ env.PUBLIC_IP }}"
-          echo "Docker Image: ${{ env.IMAGE_URI }}"
+          echo "Deployed!"
+          echo "URL: http://${{ env.PUBLIC_IP }}"
