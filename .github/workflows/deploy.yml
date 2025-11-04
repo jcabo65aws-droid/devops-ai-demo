@@ -31,10 +31,22 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       # 4️⃣ Login en ECR
-      - name: Log in to Amazon ECR
-        run: |
-          echo "🔑 Logging in to Amazon ECR..."
-          aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin ${{ env.ECR_REPO }}.dkr.ecr.$AWS_REGION.amazonaws.com
+     - name: Ensure ECR repo exists and log in
+     run: |
+      echo "🔍 Checking if ECR repository exists..."
+      REPO_NAME=${{ env.ECR_REPO }}
+      REGION=${{ env.AWS_REGION }}
+
+      if ! aws ecr describe-repositories --repository-names "$REPO_NAME" --region "$REGION" >/dev/null 2>&1; then
+        echo "🪄 Repository not found. Creating ECR repository: $REPO_NAME ..."
+        aws ecr create-repository --repository-name "$REPO_NAME" --region "$REGION"
+        echo "✅ Repository created successfully."
+      else
+       echo "✅ Repository already exists."
+      fi
+
+      echo "🔑 Logging in to Amazon ECR..."
+      aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com"
 
       # 5️⃣ Construye la imagen Docker
       - name: Build Docker image
