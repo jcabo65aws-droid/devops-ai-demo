@@ -15,9 +15,11 @@ jobs:
       INSTANCE_NAME: github-devops-instance
 
     steps:
+      # 1️⃣ Checkout del repositorio
       - name: Checkout
         uses: actions/checkout@v4
 
+      # 2️⃣ Configura credenciales AWS
       - name: Configure AWS
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -25,79 +27,96 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
+      # 3️⃣ Login en ECR
       - name: Login to ECR
         id: ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build & Push
+      # 4️⃣ Construir y subir imagen a ECR
+      - name: Build & Push Docker Image
         env:
           IMAGE_URI: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ env.IMAGE_TAG }}
         run: |
+          echo "🐳 Building and pushing image..."
           docker build -t ${{ env.ECR_REPO }} .
           docker tag ${{ env.ECR_REPO }}:latest ${{ env.IMAGE_URI }}
           docker push ${{ env.IMAGE_URI }}
           echo "IMAGE_URI=${{ env.IMAGE_URI }}" >> $GITHUB_ENV
 
+      # 5️⃣ Revisión con IA (opcional)
       - name: AI Review (optional)
+        if: ${{ secrets.OPENAI_API_KEY != '' }}
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
-          if [ -z "$OPENAI_API_KEY" ]; then
-            echo "⚠️ No OpenAI API key found. Skipping AI review."
-            exit 0
-          fi
-
-          echo "🤖 Running AI review..."
+          echo "🤖 Running AI Review..."
           curl -s https://api.openai.com/v1/chat/completions \
             -H "Authorization: Bearer $OPENAI_API_KEY" \
             -H "Content-Type: application/json" \
-            -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Review Dockerfile:\n\n'"$(cat Dockerfile)"'"}]}' | jq -r '.choices[0].message.content'
+            -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Review this Dockerfile:\n\n'"$(cat Dockerfile)"'"}]}' \
+            | jq -r '.choices[0].message.content'
 
-      - name: Launch EC2
+      # 6️⃣ Crear instancia EC2 automáticamente
+      - name: Launch EC2 Instance
         run: |
           echo "🚀 Launching EC2 instance..."
+
+          # Obtener la última AMI Amazon Linux 2
           AMI=$(aws ec2 describe-images --owners amazon \
             --filters "Name=name,Values=amzn2-ami-hvm-*-x86_64-gp2" "Name=state,Values=available" \
             --query 'Images | sort_by(@, &CreationDate) | [-1].ImageId' \
             --output text)
 
-          if [ -z "${{ vars.SUBNET_ID }}" ] || [ -z "${{ vars.SECURITY_GROUP_ID }}" ]; then
-            echo "❌ ERROR: Define SUBNET_ID and SECURITY_GROUP_ID in GitHub Variables."
-            exit 1
-          fi
+          # Obtener automáticamente la primera Subnet y Security Group disponibles
+          SUBNET_ID=$(aws ec2 describe-subnets \
+            --query 'Subnets[0].SubnetId' --output text --region ${{ env.AWS_REGION }})
 
+          SECURITY_GROUP_ID=$(aws ec2 describe-security-groups \
+            --query 'SecurityGroups[0].GroupId' --output text --region ${{ env.AWS_REGION }})
+
+          echo "📦 Using Subnet: $SUBNET_ID"
+          echo "🛡️  Using Security Group: $SECURITY_GROUP_ID"
+
+          # Crear script de inicio (user data)
           printf '%s\n' \
             '#!/bin/bash' \
             'yum update -y' \
-            'yum install -y docker' \
+            'yum install -y docker awscli' \
             'systemctl start docker' \
             'systemctl enable docker' \
             'usermod -aG docker ec2-user' \
-            "aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com" \
-            "docker pull ${{ env.IMAGE_URI }}" \
-            "docker run -d -p 80:80 ${{ env.IMAGE_URI }}" > user-data.sh
+            'aws ecr get-login-password --region '"${{ env.AWS_REGION }}"' | docker login --username AWS --password-stdin '"${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com"' ' \
+            'docker pull '"${{ env.IMAGE_URI }}"'' \
+            'docker run -d -p 80:80 '"${{ env.IMAGE_URI }}"'' > user-data.sh
 
-          ID=$(aws ec2 run-instances \
+          # Crear instancia EC2
+          INSTANCE_ID=$(aws ec2 run-instances \
             --image-id "$AMI" \
             --instance-type t3.micro \
             --key-name MyKeyPair \
-            --security-group-ids ${{ vars.SECURITY_GROUP_ID }} \
-            --subnet-id ${{ vars.SUBNET_ID }} \
+            --security-group-ids "$SECURITY_GROUP_ID" \
+            --subnet-id "$SUBNET_ID" \
             --iam-instance-profile Name=EC2ECRAccessRole \
             --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${{ env.INSTANCE_NAME }}}]" \
             --user-data file://user-data.sh \
             --query 'Instances[0].InstanceId' --output text)
 
-          echo "INSTANCE_ID=$ID" >> $GITHUB_ENV
+          echo "✅ Instance created with ID: $INSTANCE_ID"
+          echo "INSTANCE_ID=$INSTANCE_ID" >> $GITHUB_ENV
 
-      - name: Get IP
+      # 7️⃣ Obtener IP pública
+      - name: Get Public IP
         run: |
+          echo "⏳ Waiting for EC2 to be ready..."
           aws ec2 wait instance-running --instance-ids ${{ env.INSTANCE_ID }}
-          IP=$(aws ec2 describe-instances --instance-ids ${{ env.INSTANCE_ID }} \
+          PUBLIC_IP=$(aws ec2 describe-instances \
+            --instance-ids ${{ env.INSTANCE_ID }} \
             --query 'Reservations[].Instances[].PublicIpAddress' --output text)
-          echo "PUBLIC_IP=$IP" >> $GITHUB_ENV
+          echo "🌍 EC2 Public IP: $PUBLIC_IP"
+          echo "PUBLIC_IP=$PUBLIC_IP" >> $GITHUB_ENV
 
+      # 8️⃣ Confirmación final
       - name: Done
         run: |
-          echo "✅ Deployment complete!"
-          echo "🌐 Visit: http://${{ env.PUBLIC_IP }}"
+          echo "🎉 Deployment completed successfully!"
+          echo "Access your app at: http://${{ env.PUBLIC_IP }}"
