@@ -53,7 +53,6 @@ jobs:
                       "Name=instance-state-name,Values=running" \
             --query "Reservations[0].Instances[0].InstanceId" \
             --output text)
-
           if [ "$INSTANCE_ID" = "None" ]; then
             echo "Launching new EC2 instance..."
             INSTANCE_ID=$(aws ec2 run-instances \
@@ -74,7 +73,6 @@ jobs:
           else
             echo "Reusing instance: $INSTANCE_ID"
           fi
-
           echo "INSTANCE_ID=$INSTANCE_ID" >> $GITHUB_ENV
 
       - name: Get EC2 Public IP
@@ -103,12 +101,13 @@ jobs:
 
       - name: Wait for app to be ready
         run: |
-          echo "Waiting for app on EC2..."
+          echo "⏳ Waiting for app on EC2..."
           sleep 30
-          echo "App should be available soon at: http://${{ env.EC2_IP }}/"
+          echo "🌍 App should be available soon at: http://${{ env.EC2_IP }}/"
 
       - name: Test AI endpoint
         run: |
+          echo "🧠 Testing AI endpoint..."
           curl -X POST -H "Content-Type: application/json" \
             -d '{"text":"This pipeline is awesome!"}' \
             http://${{ env.EC2_IP }}/predict || exit 1
@@ -118,7 +117,7 @@ jobs:
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
-          echo "Running AI code review..."
+          echo "🤖 Running AI code review..."
           curl https://api.openai.com/v1/chat/completions \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer $OPENAI_API_KEY" \
@@ -131,4 +130,6 @@ jobs:
             }' | jq '.choices[0].message.content'
 
       - name: Deployment finished
-        run: echo "Deployment complete! Access app at: http://${{ env.EC2_IP }}/"
+        run: |
+          echo "🎉 Deployment complete! Access app at: http://${{ env.EC2_IP }}/"
+
