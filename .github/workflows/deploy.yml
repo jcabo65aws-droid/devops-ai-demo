@@ -30,15 +30,18 @@ jobs:
 
       - name: Build Docker image
         run: |
+          echo "🚀 Building Docker image..."
           docker build -t $IMAGE_NAME .
 
       - name: Create ECR repository if missing
         run: |
+          echo "🪣 Checking ECR repository..."
           aws ecr describe-repositories --repository-names $IMAGE_NAME || \
           aws ecr create-repository --repository-name $IMAGE_NAME
 
       - name: Push image to ECR
         run: |
+          echo "📦 Pushing image to ECR..."
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
           ECR_URI=$ACCOUNT_ID.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/$IMAGE_NAME
           docker tag $IMAGE_NAME:latest $ECR_URI:latest
@@ -54,7 +57,7 @@ jobs:
             --query "Reservations[0].Instances[0].InstanceId" \
             --output text)
           if [ "$INSTANCE_ID" = "None" ]; then
-            echo "Launching new EC2 instance..."
+            echo "🆕 Launching new EC2 instance..."
             INSTANCE_ID=$(aws ec2 run-instances \
               --image-id ami-0e86e20dae9224db8 \
               --instance-type ${{ env.EC2_INSTANCE_TYPE }} \
@@ -69,15 +72,16 @@ jobs:
               --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=github-devops-instance}]' \
               --query "Instances[0].InstanceId" \
               --output text)
-            echo "New instance launched: $INSTANCE_ID"
+            echo "✅ New instance launched: $INSTANCE_ID"
           else
-            echo "Reusing instance: $INSTANCE_ID"
+            echo "♻️ Reusing existing instance: $INSTANCE_ID"
           fi
           echo "INSTANCE_ID=$INSTANCE_ID" >> $GITHUB_ENV
 
       - name: Get EC2 Public IP
         id: ec2-ip
         run: |
+          echo "🌍 Getting EC2 public IP..."
           PUBLIC_IP=$(aws ec2 describe-instances \
             --instance-ids $INSTANCE_ID \
             --query "Reservations[0].Instances[0].PublicIpAddress" \
@@ -92,6 +96,7 @@ jobs:
           username: ec2-user
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
+            echo "🐳 Deploying container on EC2..."
             sudo docker stop devops-ai-demo || true
             sudo docker rm devops-ai-demo || true
             sudo docker pull $ECR_URI:latest
@@ -103,7 +108,7 @@ jobs:
         run: |
           echo "⏳ Waiting for app on EC2..."
           sleep 30
-          echo "🌍 App should be available soon at: http://${{ env.EC2_IP }}/"
+          echo "App should be available soon at: http://${{ env.EC2_IP }}/"
 
       - name: Test AI endpoint
         run: |
@@ -113,10 +118,14 @@ jobs:
             http://${{ env.EC2_IP }}/predict || exit 1
 
       - name: Optional AI Review (OpenAI)
-        if: ${{ secrets.OPENAI_API_KEY != '' }}
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
+          if [ -z "$OPENAI_API_KEY" ]; then
+            echo "⚠️  No OPENAI_API_KEY found. Skipping AI code review."
+            exit 0
+          fi
+
           echo "🤖 Running AI code review..."
           curl https://api.openai.com/v1/chat/completions \
             -H "Content-Type: application/json" \
@@ -125,11 +134,11 @@ jobs:
               "model": "gpt-4o-mini",
               "messages": [
                 {"role": "system", "content": "You are an AI DevOps reviewer."},
-                {"role": "user", "content": "Analyze this deployment YAML for best practices."}
+                {"role": "user", "content": "Analyze this deployment YAML for best practices and suggest improvements."}
               ]
             }' | jq '.choices[0].message.content'
 
       - name: Deployment finished
         run: |
-          echo "🎉 Deployment complete! Access app at: http://${{ env.EC2_IP }}/"
-
+          echo "🎉 Deployment complete!"
+          echo "✅ Access your app at: http://${{ env.EC2_IP }}/"
