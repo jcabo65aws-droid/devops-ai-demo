@@ -1,4 +1,4 @@
-name: 🚀 DevOps AI Deploy
+name: DevOps AI Deploy
 
 on:
   push:
@@ -14,30 +14,30 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: 🧩 Checkout repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: 🪄 Configure AWS credentials
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: 🔐 Log in to Amazon ECR
+      - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: 🏗️ Build Docker image
+      - name: Build Docker image
         run: |
           docker build -t $IMAGE_NAME .
 
-      - name: 🪣 Create ECR repository if it doesn't exist
+      - name: Create ECR repository if missing
         run: |
           aws ecr describe-repositories --repository-names $IMAGE_NAME || \
           aws ecr create-repository --repository-name $IMAGE_NAME
 
-      - name: 🧱 Tag & Push image to ECR
+      - name: Push image to ECR
         run: |
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
           ECR_URI=$ACCOUNT_ID.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/$IMAGE_NAME
@@ -45,7 +45,7 @@ jobs:
           docker push $ECR_URI:latest
           echo "ECR_URI=$ECR_URI" >> $GITHUB_ENV
 
-      - name: 🖥️ Launch or reuse EC2 instance
+      - name: Launch or reuse EC2 instance
         id: ec2
         run: |
           INSTANCE_ID=$(aws ec2 describe-instances \
@@ -77,7 +77,7 @@ jobs:
 
           echo "INSTANCE_ID=$INSTANCE_ID" >> $GITHUB_ENV
 
-      - name: 🌍 Get EC2 Public IP
+      - name: Get EC2 Public IP
         id: ec2-ip
         run: |
           PUBLIC_IP=$(aws ec2 describe-instances \
@@ -87,7 +87,7 @@ jobs:
           echo "EC2_IP=$PUBLIC_IP" >> $GITHUB_ENV
           echo "Public IP: $PUBLIC_IP"
 
-      - name: 🐳 Deploy Docker container on EC2
+      - name: Deploy container on EC2
         uses: appleboy/ssh-action@v1.1.0
         with:
           host: ${{ env.EC2_IP }}
@@ -101,19 +101,19 @@ jobs:
               -e OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }} \
               $ECR_URI:latest
 
-      - name: ⏳ Wait for app to be ready
+      - name: Wait for app to be ready
         run: |
           echo "Waiting for app on EC2..."
           sleep 30
           echo "App should be available soon at: http://${{ env.EC2_IP }}/"
 
-      - name: 🧠 Test AI endpoint
+      - name: Test AI endpoint
         run: |
           curl -X POST -H "Content-Type: application/json" \
             -d '{"text":"This pipeline is awesome!"}' \
             http://${{ env.EC2_IP }}/predict || exit 1
 
-      - name: 🤖 Optional AI Review (using OpenAI)
+      - name: Optional AI Review (OpenAI)
         if: ${{ secrets.OPENAI_API_KEY != '' }}
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -126,9 +126,9 @@ jobs:
               "model": "gpt-4o-mini",
               "messages": [
                 {"role": "system", "content": "You are an AI DevOps reviewer."},
-                {"role": "user", "content": "Analyze this deployment YAML and give feedback on CI/CD quality and security."}
+                {"role": "user", "content": "Analyze this deployment YAML for best practices."}
               ]
             }' | jq '.choices[0].message.content'
 
-      - name: ✅ Deployment finished
-        run: echo "🎉 Deployment complete! Access app at: http://${{ env.EC2_IP }}/"
+      - name: Deployment finished
+        run: echo "Deployment complete! Access app at: http://${{ env.EC2_IP }}/"
