@@ -52,7 +52,7 @@ jobs:
           docker push $ECR_URI:latest
           echo "ECR_URI=$ECR_URI" >> $GITHUB_ENV
 
-      # 7️⃣ Lanzar o reutilizar instancia EC2 (sin SSH)
+      # 7️⃣ Lanzar o reutilizar instancia EC2
       - name: Launch or reuse EC2 instance
         id: ec2
         run: |
@@ -78,6 +78,8 @@ jobs:
                 yum install -y docker aws-cli
                 systemctl enable docker
                 systemctl start docker
+                ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+                ECR_URI=$ACCOUNT_ID.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.IMAGE_NAME }}
                 aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin $ECR_URI
                 docker pull $ECR_URI:latest
                 docker run -d -p 80:80 --name devops-ai-demo -e OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }} $ECR_URI:latest" \
@@ -121,12 +123,12 @@ jobs:
 
       # 1️⃣1️⃣ Revisión de código por IA
       - name: Optional AI Review
-        if: ${{ always() }}
+        if: always()
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
           if [ -z "$OPENAI_API_KEY" ]; then
-            echo "⚠️  No OpenAI API key found. Skipping review."
+            echo "⚠️ No OpenAI API key found. Skipping review."
             exit 0
           fi
           echo "🤖 Running AI code review..."
@@ -143,4 +145,6 @@ jobs:
 
       # 1️⃣2️⃣ Finalización
       - name: Deployment finished
-        run: echo "🎉 Deployment complete! Access app at: http://${{ env.EC2_IP }}/"
+        run: |
+          echo "🎉 Deployment complete!"
+          echo "Access app at: http://${{ env.EC2_IP }}/"
