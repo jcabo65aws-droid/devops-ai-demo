@@ -1,150 +1,59 @@
-name: DevOps AI Deploy
+name: Deploy AI Demo (EC2 + Docker)
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ main ]
 
 env:
-  AWS_REGION: us-east-1
-  EC2_INSTANCE_TYPE: t3.micro
-  IMAGE_NAME: devops-ai-demo
-  INSTANCE_NAME: github-devops-instance
+  IMAGE_NAME: ai-demo
+  CONTAINER_NAME: ai-demo
 
 jobs:
-  deploy:
+  build-and-deploy:
     runs-on: ubuntu-latest
-
     steps:
-      # 1️⃣ Checkout del repositorio
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      # 2️⃣ Configurar credenciales AWS
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+      - name: Compute tag
+        id: meta
+        run: echo "TAG=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+
+      - name: Login to Docker Hub
+        run: echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+
+      - name: Build image
+        run: |
+          REPO="${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}"
+          docker build -t "$REPO:${{ steps.meta.outputs.TAG }}" -t "$REPO:latest" .
+
+      - name: Push image
+        run: |
+          REPO="${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}"
+          docker push "$REPO:${{ steps.meta.outputs.TAG }}"
+          docker push "$REPO:latest"
+
+      - name: SSH redeploy on EC2
+        uses: appleboy/ssh-action@v1.0.3
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      # 3️⃣ Login a Amazon ECR
-      - name: Login to Amazon ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
-
-      # 4️⃣ Construir la imagen Docker
-      - name: Build Docker image
-        run: |
-          docker build -t $IMAGE_NAME .
-
-      # 5️⃣ Crear repositorio ECR si no existe
-      - name: Create ECR repository if missing
-        run: |
-          aws ecr describe-repositories --repository-names $IMAGE_NAME || \
-          aws ecr create-repository --repository-name $IMAGE_NAME
-
-      # 6️⃣ Publicar imagen en ECR
-      - name: Push image to ECR
-        run: |
-          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-          ECR_URI=$ACCOUNT_ID.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/$IMAGE_NAME
-          docker tag $IMAGE_NAME:latest $ECR_URI:latest
-          docker push $ECR_URI:latest
-          echo "ECR_URI=$ECR_URI" >> $GITHUB_ENV
-
-      # 7️⃣ Lanzar o reutilizar instancia EC2
-      - name: Launch or reuse EC2 instance
-        id: ec2
-        run: |
-          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-          ECR_URI=$ACCOUNT_ID.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.IMAGE_NAME }}
-
-          INSTANCE_ID=$(aws ec2 describe-instances \
-            --filters "Name=tag:Name,Values=${{ env.INSTANCE_NAME }}" \
-                      "Name=instance-state-name,Values=running" \
-            --query "Reservations[0].Instances[0].InstanceId" \
-            --output text)
-
-          if [ "$INSTANCE_ID" = "None" ]; then
-            echo "🚀 Launching new EC2 instance..."
-            INSTANCE_ID=$(aws ec2 run-instances \
-              --image-id ami-0e86e20dae9224db8 \
-              --instance-type ${{ env.EC2_INSTANCE_TYPE }} \
-              --iam-instance-profile Name=EC2ECRAccessRole \
-              --security-group-ids sg-05a41bf291232115e \
-              --subnet-id subnet-0bc8bd98802435140 \
-              --user-data "#!/bin/bash
-                yum update -y
-                yum install -y docker aws-cli
-                systemctl enable docker
-                systemctl start docker
-                ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-                ECR_URI=$ACCOUNT_ID.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.IMAGE_NAME }}
-                aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin $ECR_URI
-                docker pull $ECR_URI:latest
-                docker run -d -p 80:80 --name devops-ai-demo -e OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }} $ECR_URI:latest" \
-              --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=${{ env.INSTANCE_NAME }}}]' \
-              --query "Instances[0].InstanceId" \
-              --output text)
-            echo "✅ New instance launched: $INSTANCE_ID"
-          else
-            echo "♻️ Reusing existing instance: $INSTANCE_ID"
-          fi
-
-          echo "INSTANCE_ID=$INSTANCE_ID" >> $GITHUB_ENV
-
-      # 8️⃣ Obtener IP pública
-      - name: Get EC2 Public IP
-        id: ec2-ip
-        run: |
-          aws ec2 wait instance-running --instance-ids $INSTANCE_ID
-          PUBLIC_IP=$(aws ec2 describe-instances \
-            --instance-ids $INSTANCE_ID \
-            --query "Reservations[0].Instances[0].PublicIpAddress" \
-            --output text)
-          echo "EC2_IP=$PUBLIC_IP" >> $GITHUB_ENV
-          echo "🌍 EC2 Public IP: $PUBLIC_IP"
-
-      # 9️⃣ Esperar despliegue y probar endpoint
-      - name: Wait for app to start
-        run: |
-          echo "⏳ Waiting 60s for the app to initialize..."
-          sleep 60
-          echo "Checking if app responds..."
-          curl -I http://${{ env.EC2_IP }} || echo "App not responding yet."
-
-      # 🔟 Test AI endpoint
-      - name: Test AI endpoint
-        run: |
-          echo "🧠 Testing AI endpoint..."
-          curl -X POST -H "Content-Type: application/json" \
-            -d '{"text":"Hello AI!"}' \
-            http://${{ env.EC2_IP }}/predict || echo "⚠️ AI endpoint not ready"
-
-      # 1️⃣1️⃣ Revisión de código por IA
-      - name: Optional AI Review
-        if: always()
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-        run: |
-          if [ -z "$OPENAI_API_KEY" ]; then
-            echo "⚠️ No OpenAI API key found. Skipping review."
-            exit 0
-          fi
-          echo "🤖 Running AI code review..."
-          curl https://api.openai.com/v1/chat/completions \
-            -H "Content-Type: application/json" \
-            -H "Authorization: Bearer $OPENAI_API_KEY" \
-            -d '{
-              "model": "gpt-4o-mini",
-              "messages": [
-                {"role": "system", "content": "You are an AI DevOps reviewer."},
-                {"role": "user", "content": "Analyze this pipeline YAML for best practices."}
-              ]
-            }' | jq -r '.choices[0].message.content'
-
-      # 1️⃣2️⃣ Finalización
-      - name: Deployment finished
-        run: |
-          echo "🎉 Deployment complete!"
-          echo "Access app at: http://${{ env.EC2_IP }}/"
+          host: ${{ secrets.EC2_HOST }}
+          username: ec2-user
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script_stop: true
+          script: |
+            set -e
+            if ! command -v docker >/dev/null 2>&1; then
+              sudo dnf update -y || sudo yum update -y
+              if command -v dnf >/dev/null 2>&1; then
+                sudo dnf install -y docker
+              else
+                sudo yum install -y docker
+              fi
+              sudo systemctl enable --now docker
+              sudo usermod -aG docker "$USER" || true
+            fi
+            sudo systemctl start docker || true
+            REPO="${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}"
+            sudo docker pull "$REPO:latest"
+            sudo docker rm -f "${{ env.CONTAINER_NAME }}" || true
+            sudo docker run -d --name "${{ env.CONTAINER_NAME }}" -p 80:8080 "$REPO:latest"
