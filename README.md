@@ -1,4 +1,4 @@
-# DevOps + AI Demo (Free Tier, Determinista)
+# DevOps + AI Demo (Free Tier, Determinista), Prueba
 
 Este proyecto está listo para laboratorio **sin opcionales**: misma imagen, mismo contenedor, mismo pipeline.  
 Objetivo: app Flask con análisis de sentimiento (VADER), empaquetada en Docker, desplegada vía GitHub Actions a una EC2 **t2.micro** (capa gratuita).
