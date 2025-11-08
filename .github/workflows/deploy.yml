@@ -2,7 +2,7 @@ name: Deploy AI Demo (auto EC2 + ECR + SSM)
 
 on:
   push:
-    branches: [ main ]
+    branches: [ "main" ]
 
 env:
   IMAGE_NAME: ai-demo
@@ -31,20 +31,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "TAG=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+          echo "TAG=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
           ACCOUNT_ID=$(aws sts get-caller-identity --query 'Account' --output text)
-          echo "ACCOUNT_ID=$ACCOUNT_ID" >> $GITHUB_OUTPUT
-          echo "ECR_REGISTRY=$ACCOUNT_ID.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com" >> $GITHUB_OUTPUT
-          echo "ECR_URI=$ACCOUNT_ID.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.IMAGE_NAME }}" >> $GITHUB_OUTPUT
+          echo "ACCOUNT_ID=$ACCOUNT_ID" >> "$GITHUB_OUTPUT"
+          echo "ECR_REGISTRY=$ACCOUNT_ID.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com" >> "$GITHUB_OUTPUT"
+          echo "ECR_URI=$ACCOUNT_ID.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.IMAGE_NAME }}" >> "$GITHUB_OUTPUT"
 
-       - name: Ensure ECR repository
+      - name: Ensure ECR repository
         shell: bash
         run: |
           set -euo pipefail
           REPO="${{ env.IMAGE_NAME }}"
-          # describe: usa --repository-names (plural)
           aws ecr describe-repositories --repository-names "$REPO" >/dev/null 2>&1 || \
-          # create: usa --repository-name (singular)
           aws ecr create-repository --repository-name "$REPO" \
             --image-scanning-configuration scanOnPush=true \
             --encryption-configuration encryptionType=AES256 >/dev/null
@@ -74,15 +72,15 @@ jobs:
           set -euo pipefail
           VPC=$(aws ec2 describe-vpcs --filters Name=isDefault,Values=true --query 'Vpcs[0].VpcId' --output text)
           if [ -z "$VPC" ] || [ "$VPC" = "None" ]; then echo "No default VPC found"; exit 1; fi
-          SUBNET=$(aws ec2 describe-subnets --filters Name=vpc-id,Values=$VPC Name=map-public-ip-on-launch,Values=true \
+          SUBNET=$(aws ec2 describe-subnets --filters Name=vpc-id,Values="$VPC" Name=map-public-ip-on-launch,Values=true \
                     --query 'Subnets[0].SubnetId' --output text)
           if [ -z "$SUBNET" ] || [ "$SUBNET" = "None" ]; then
-            SUBNET=$(aws ec2 describe-subnets --filters Name=vpc-id,Values=$VPC \
+            SUBNET=$(aws ec2 describe-subnets --filters Name=vpc-id,Values="$VPC" \
                       --query 'Subnets[0].SubnetId' --output text)
           fi
           if [ -z "$SUBNET" ] || [ "$SUBNET" = "None" ]; then echo "Could not find a subnet in VPC $VPC"; exit 1; fi
-          echo "VPC=$VPC" >> $GITHUB_OUTPUT
-          echo "SUBNET=$SUBNET" >> $GITHUB_OUTPUT
+          echo "VPC=$VPC" >> "$GITHUB_OUTPUT"
+          echo "SUBNET=$SUBNET" >> "$GITHUB_OUTPUT"
 
       # ---------- CloudFormation: crea/actualiza la EC2 ----------
       - name: Write CloudFormation template
@@ -144,6 +142,14 @@ jobs:
                 IamInstanceProfile: !Ref EC2InstanceProfile
                 InstanceType: !Ref InstanceType
                 ImageId: !Sub "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}"
+                UserData:
+                  Fn::Base64: !Sub |
+                    #!/bin/bash
+                    set -euxo pipefail
+                    if ! command -v amazon-ssm-agent >/dev/null 2>&1; then
+                      (command -v dnf >/dev/null 2>&1 && sudo dnf -y install amazon-ssm-agent) || sudo yum -y install amazon-ssm-agent
+                    fi
+                    systemctl enable --now amazon-ssm-agent
                 NetworkInterfaces:
                   - DeviceIndex: 0
                     SubnetId: !Ref SubnetId
@@ -180,9 +186,9 @@ jobs:
                       "Name=tag:${{ env.APP_TAG_KEY }},Values=${{ env.APP_TAG_VALUE }}" \
             --query 'Reservations[].Instances[].InstanceId' --output text | head -n1)
           if [ -z "$ID" ] || [ "$ID" = "None" ]; then echo "No running instance found"; exit 1; fi
-          echo "INSTANCE_ID=$ID" >> $GITHUB_OUTPUT
+          echo "INSTANCE_ID=$ID" >> "$GITHUB_OUTPUT"
           IP=$(aws ec2 describe-instances --instance-ids "$ID" --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
-          echo "PUBLIC_IP=$IP" >> $GITHUB_OUTPUT
+          echo "PUBLIC_IP=$IP" >> "$GITHUB_OUTPUT"
           echo "Instance: $ID  IP: $IP"
 
       - name: Wait for SSM Online
