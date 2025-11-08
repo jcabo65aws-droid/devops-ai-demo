@@ -9,7 +9,7 @@ env:
   CONTAINER_NAME: ai-demo
   APP_TAG_KEY: App
   APP_TAG_VALUE: ai-demo
-  PORT: "80"
+  PORT: "80"             # puerto del host
   STACK_NAME: ai-demo-ec2
 
 jobs:
@@ -146,13 +146,8 @@ jobs:
                   Fn::Base64: !Sub |
                     #!/bin/bash
                     set -euxo pipefail
-                    # Asegurar SSM agent activo (AL2023 normalmente ya lo trae)
-                    if ! systemctl is-enabled --quiet amazon-ssm-agent; then
-                      (command -v dnf >/dev/null 2>&1 && sudo dnf -y install amazon-ssm-agent) || sudo yum -y install amazon-ssm-agent
-                      systemctl enable --now amazon-ssm-agent
-                    else
-                      systemctl enable --now amazon-ssm-agent
-                    fi
+                    # Asegurar SSM agent activo (AL2023 suele traerlo)
+                    systemctl enable --now amazon-ssm-agent || true
                 NetworkInterfaces:
                   - DeviceIndex: 0
                     SubnetId: !Ref SubnetId
@@ -213,7 +208,7 @@ jobs:
           echo "Instance not Online in SSM"
           exit 1
 
-      # ---------- Despliegue por SSM ----------
+      # ---------- Despliegue por SSM (host 80 -> container 8080) ----------
       - name: Deploy via SSM (install docker + run container)
         shell: bash
         run: |
@@ -234,10 +229,10 @@ jobs:
               "sudo systemctl start docker || true",
               "sudo docker pull ${ECR_URI}:latest",
               "sudo docker rm -f ${NAME} || true",
-              "sudo docker run -d --name ${NAME} -p ${PORT}:80 ${ECR_URI}:latest",
+              "sudo docker run -d --name ${NAME} -e PORT=8080 -e HF_MODEL=sshleifer/tiny-distilroberta-base -p ${PORT}:8080 ${ECR_URI}:latest",
               "sudo docker ps --format 'table {{.Names}}\\t{{.Image}}\\t{{.Status}}\\t{{.Ports}}'",
               "sudo ss -ltnp | sed -n '1,200p' || true",
-              "curl -s -o /dev/null -w 'code=%{http_code}\\n' http://localhost/health || true"
+              "curl -s -o /dev/null -w 'code=%{http_code}\\n' http://localhost:8080/health || true"
             ]
           }
           JSON
@@ -276,7 +271,7 @@ jobs:
               "set -e",
               "docker ps --format '\''table {{.Names}}\\t{{.Image}}\\t{{.Status}}\\t{{.Ports}}'\'' || true",
               "docker logs --tail 80 ai-demo || true",
-              "curl -s -o /dev/null -w '\''code=%{http_code}\\n'\'' http://localhost/health || true",
+              "curl -s -o /dev/null -w '\''code=%{http_code}\\n'\'' http://localhost:8080/health || true",
               "sudo ss -ltnp | sed -n '\''1,200p'\'' || true",
               "journalctl -u docker --no-pager | tail -n 120 || true"
             ]' \
