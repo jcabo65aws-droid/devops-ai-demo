@@ -9,7 +9,7 @@ env:
   CONTAINER_NAME: ai-demo
   APP_TAG_KEY: App
   APP_TAG_VALUE: ai-demo
-  PORT: "80"                 # La app escucha en 8080 dentro del contenedor; se expone en 80
+  PORT: "80"
   STACK_NAME: ai-demo-ec2
 
 jobs:
@@ -187,7 +187,7 @@ jobs:
         run: |
           set -euo pipefail
           ID="${{ steps.discover.outputs.INSTANCE_ID }}"
-          for i in {1..40}; do
+          for i in $(seq 1 40); do
             PING=$(aws ssm describe-instance-information \
               --filters Key=InstanceIds,Values="$ID" \
               --query 'InstanceInformationList[0].PingStatus' --output text 2>/dev/null || true)
@@ -195,9 +195,10 @@ jobs:
             if [ "$PING" = "Online" ]; then exit 0; fi
             sleep 6
           done
-          echo "Instance not Online in SSM"; exit 1
+          echo "Instance not Online in SSM"
+          exit 1
 
-      # ---------- Despliegue por SSM (sin escapes YAML problemáticos) ----------
+      # ---------- Despliegue por SSM (sin escapes YAML) ----------
       - name: Deploy via SSM (install docker + run container)
         shell: bash
         run: |
@@ -232,33 +233,32 @@ jobs:
             --query 'Command.CommandId' --output text)
           echo "CMD_ID=$CMD_ID"
 
-          for i in {1..40}; do
+          for i in $(seq 1 40); do
             STATUS=$(aws ssm list-command-invocations --command-id "$CMD_ID" --details \
               --query 'CommandInvocations[0].Status' --output text 2>/dev/null || true)
             echo "SSM status: $STATUS"
             if [ "$STATUS" = "Success" ]; then break; fi
             if echo "$STATUS" | grep -E -q 'Cancelled|Failed|TimedOut'; then
-              echo "SSM command failed: $STATUS"; exit 1
+              echo "SSM command failed: $STATUS"
+              exit 1
             fi
             sleep 5
           done
 
+      # ---------- Health externo ----------
       - name: External health check
         shell: bash
         run: |
           set -euo pipefail
           IP="${{ steps.discover.outputs.PUBLIC_IP }}"
-          for i in {1..30}; do
+          for i in $(seq 1 30); do
             CODE=$(curl -s -o /dev/null -w '%{http_code}' "http://$IP/health" || true)
             echo "health http_code=$CODE"
             if [ "$CODE" = "200" ]; then
-              echo "APP_URL=http://$IP" >> $GITHUB_OUTPUT
+              echo "App disponible en: http://$IP/"
               exit 0
             fi
             sleep 3
           done
-          echo "Service not healthy on $IP"; exit 1
-
-      - name: Show app URL
-        shell: bash
-        run: echo "App disponible en: http://${{ steps.discover.outputs.PUBLIC_IP }}/"
+          echo "Service not healthy on $IP"
+          exit 1
