@@ -1,0 +1,74 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: EC2 t2.micro with SSM & ECR read, SG open on 80, public IP.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC Id for the security group.
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet ID (public) where the instance will be created.
+  InstanceType:
+    Type: String
+    Default: t2.micro
+    AllowedValues: [t2.micro, t3.micro, t3.small]
+  AppTagValue:
+    Type: String
+    Default: ai-demo
+
+Resources:
+  EC2SSMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: EC2SSMRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: EC2SSMInstanceProfile
+      Roles: [ !Ref EC2SSMRole ]
+
+  InstanceSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP (80) for ai-demo
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      InstanceType: !Ref InstanceType
+      ImageId: !Sub "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}"
+      NetworkInterfaces:
+        - DeviceIndex: 0
+          SubnetId: !Ref SubnetId
+          AssociatePublicIpAddress: true
+          GroupSet: [ !Ref InstanceSG ]
+          DeleteOnTermination: true
+      Tags:
+        - { Key: Name, Value: !Sub "ai-demo-${AppTagValue}" }
+        - { Key: App,  Value: !Ref AppTagValue }
+
+Outputs:
+  InstanceId:
+    Value: !Ref EC2Instance
+  SecurityGroupId:
+    Value: !Ref InstanceSG
