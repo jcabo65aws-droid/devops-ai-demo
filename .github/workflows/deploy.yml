@@ -146,10 +146,13 @@ jobs:
                   Fn::Base64: !Sub |
                     #!/bin/bash
                     set -euxo pipefail
-                    if ! command -v amazon-ssm-agent >/dev/null 2>&1; then
+                    # Asegurar SSM agent activo (AL2023 normalmente ya lo trae)
+                    if ! systemctl is-enabled --quiet amazon-ssm-agent; then
                       (command -v dnf >/dev/null 2>&1 && sudo dnf -y install amazon-ssm-agent) || sudo yum -y install amazon-ssm-agent
+                      systemctl enable --now amazon-ssm-agent
+                    else
+                      systemctl enable --now amazon-ssm-agent
                     fi
-                    systemctl enable --now amazon-ssm-agent
                 NetworkInterfaces:
                   - DeviceIndex: 0
                     SubnetId: !Ref SubnetId
@@ -175,19 +178,22 @@ jobs:
             --capabilities CAPABILITY_NAMED_IAM \
             --parameter-overrides VpcId=${{ steps.net.outputs.VPC }} SubnetId=${{ steps.net.outputs.SUBNET }} AppTagValue=${{ env.APP_TAG_VALUE }} InstanceType=t2.micro
 
-      # ---------- Descubre la instancia creada (por tag) ----------
-      - name: Discover instance by tag (running only)
+      # ---------- Descubre LA instancia del stack (no por tag) ----------
+      - name: Get instance from stack output
         id: discover
         shell: bash
         run: |
           set -euo pipefail
-          ID=$(aws ec2 describe-instances \
-            --filters "Name=instance-state-name,Values=running" \
-                      "Name=tag:${{ env.APP_TAG_KEY }},Values=${{ env.APP_TAG_VALUE }}" \
-            --query 'Reservations[].Instances[].InstanceId' --output text | head -n1)
-          if [ -z "$ID" ] || [ "$ID" = "None" ]; then echo "No running instance found"; exit 1; fi
+          ID=$(aws cloudformation describe-stacks \
+            --stack-name "${{ env.STACK_NAME }}" \
+            --query 'Stacks[0].Outputs[?OutputKey==`InstanceId`].OutputValue' \
+            --output text)
+          if [ -z "$ID" ] || [ "$ID" = "None" ]; then
+            echo "No InstanceId in stack outputs"; exit 1
+          fi
           echo "INSTANCE_ID=$ID" >> "$GITHUB_OUTPUT"
-          IP=$(aws ec2 describe-instances --instance-ids "$ID" --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+          IP=$(aws ec2 describe-instances --instance-ids "$ID" \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
           echo "PUBLIC_IP=$IP" >> "$GITHUB_OUTPUT"
           echo "Instance: $ID  IP: $IP"
 
@@ -207,7 +213,7 @@ jobs:
           echo "Instance not Online in SSM"
           exit 1
 
-      # ---------- Despliegue por SSM (sin escapes YAML) ----------
+      # ---------- Despliegue por SSM ----------
       - name: Deploy via SSM (install docker + run container)
         shell: bash
         run: |
@@ -219,7 +225,6 @@ jobs:
           NAME="${{ env.CONTAINER_NAME }}"
           PORT="${{ env.PORT }}"
 
-          # OJO: heredoc SIN comillas para que se expandan ${...}
           cat > /tmp/ssm-commands.json <<JSON
           {
             "commands": [
@@ -231,8 +236,8 @@ jobs:
               "sudo docker rm -f ${NAME} || true",
               "sudo docker run -d --name ${NAME} -p ${PORT}:80 ${ECR_URI}:latest",
               "sudo docker ps --format 'table {{.Names}}\\t{{.Image}}\\t{{.Status}}\\t{{.Ports}}'",
-              "sudo ss -ltnp | grep ':80' || true",
-              "curl -s http://localhost/health || true"
+              "sudo ss -ltnp | sed -n '1,200p' || true",
+              "curl -s -o /dev/null -w 'code=%{http_code}\\n' http://localhost/health || true"
             ]
           }
           JSON
@@ -255,6 +260,38 @@ jobs:
               exit 1
             fi
             sleep 5
+          done
+
+      # ---------- Diagnóstico útil (ver dentro de la EC2) ----------
+      - name: SSM diag (docker ps + logs + local curl)
+        shell: bash
+        run: |
+          set -euo pipefail
+          ID="${{ steps.discover.outputs.INSTANCE_ID }}"
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "$ID" \
+            --document-name "AWS-RunShellScript" \
+            --comment "diag ai-demo" \
+            --parameters commands='[
+              "set -e",
+              "docker ps --format '\''table {{.Names}}\\t{{.Image}}\\t{{.Status}}\\t{{.Ports}}'\'' || true",
+              "docker logs --tail 80 ai-demo || true",
+              "curl -s -o /dev/null -w '\''code=%{http_code}\\n'\'' http://localhost/health || true",
+              "sudo ss -ltnp | sed -n '\''1,200p'\'' || true",
+              "journalctl -u docker --no-pager | tail -n 120 || true"
+            ]' \
+            --query 'Command.CommandId' --output text)
+          for i in $(seq 1 20); do
+            S=$(aws ssm list-command-invocations --command-id "$CMD_ID" --details \
+              --query 'CommandInvocations[0].Status' --output text 2>/dev/null || true)
+            echo "diag status: $S"
+            if [ "$S" = "Success" ]; then
+              echo "----- SSM OUTPUT -----"
+              aws ssm list-command-invocations --command-id "$CMD_ID" --details \
+                --query 'CommandInvocations[0].CommandPlugins[0].Output' --output text || true
+              break
+            fi
+            sleep 3
           done
 
       # ---------- Health externo ----------
