@@ -1,42 +1,29 @@
-from flask import Flask, request, jsonify, send_from_directory
-from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-import os
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>DevOps + AI Demo</title>
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 720px; margin: 4rem auto; }
+    h1 { color: #2d6cdf; }
+    input, button { padding: 0.6rem; }
+  </style>
+</head>
+<body>
+  <h1>🚀 DevOps + AI (Free Tier)</h1>
+  <p>Escribe un texto y te digo el sentimiento usando VADER.</p>
+  <input id="txt" placeholder="Type something..." style="width:70%"/>
+  <button onclick="go()">Predict</button>
+  <pre id="out"></pre>
+  <script>
+    async function go(){
+      const text = document.getElementById('txt').value;
+      const r = await fetch('/predict', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({text})});
+      document.getElementById('out').textContent = await r.text();
+    }
+  </script>
+</body>
+</html>
 
-app = Flask(__name__, static_folder="static", static_url_path="")
-analyzer = SentimentIntensityAnalyzer()
-
-@app.route("/")
-def root():
-    # Sirve index.html estático
-    return send_from_directory("static", "index.html")
-
-@app.route("/health")
-def health():
-    return jsonify({"status": "ok"})
-
-@app.route("/predict", methods=["POST"])
-def predict():
-    data = request.get_json(silent=True) or {}
-    text = data.get("text", "").strip()
-    if not text:
-        return jsonify({"error": "Missing 'text' field"}), 400
-
-    scores = analyzer.polarity_scores(text)
-    comp = scores["compound"]
-    if comp >= 0.05:
-        label = "Positive"
-    elif comp <= -0.05:
-        label = "Negative"
-    else:
-        label = "Neutral"
-
-    return jsonify({
-        "input": text,
-        "prediction": label,
-        "scores": scores
-    })
-
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
 
