@@ -1,4 +1,4 @@
-name: Deploy AI Demo (EC2 + Docker)
+name: Deploy AI Demo (ECR + SSM, autodiscovery)
 
 on:
   push:
@@ -7,53 +7,210 @@ on:
 env:
   IMAGE_NAME: ai-demo
   CONTAINER_NAME: ai-demo
+  APP_TAG_KEY: App
+  APP_TAG_VALUE: ai-demo   # <- todas tus EC2 objetivo deben tener este tag
+  PORT: "80"
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Compute tag
-        id: meta
-        run: echo "TAG=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Login to Docker Hub
-        run: echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+      - name: Compute metadata
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "TAG=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+          ACCOUNT_ID=$(aws sts get-caller-identity --query 'Account' --output text)
+          echo "ACCOUNT_ID=$ACCOUNT_ID" >> $GITHUB_OUTPUT
+          echo "ECR_REGISTRY=$ACCOUNT_ID.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com" >> $GITHUB_OUTPUT
+          echo "ECR_REPO=${{ env.IMAGE_NAME }}" >> $GITHUB_OUTPUT
+          echo "ECR_URI=$ACCOUNT_ID.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.IMAGE_NAME }}" >> $GITHUB_OUTPUT
+
+      - name: Ensure ECR repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws ecr describe-repositories --repository-names "${{ env.IMAGE_NAME }}" >/dev/null 2>&1 || \
+          aws ecr create-repository --repository-names "${{ env.IMAGE_NAME }}" \
+            --image-scanning-configuration scanOnPush=true \
+            --encryption-configuration encryptionType=AES256 >/dev/null
+
+      - name: Login to ECR
+        shell: bash
+        run: |
+          aws ecr get-login-password \
+            | docker login --username AWS --password-stdin "${{ steps.meta.outputs.ECR_REGISTRY }}"
 
       - name: Build image
+        shell: bash
         run: |
-          REPO="${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}"
-          docker build -t "$REPO:${{ steps.meta.outputs.TAG }}" -t "$REPO:latest" .
+          docker build -t "${{ steps.meta.outputs.ECR_URI }}:${{ steps.meta.outputs.TAG }}" \
+                       -t "${{ steps.meta.outputs.ECR_URI }}:latest" .
 
       - name: Push image
+        shell: bash
         run: |
-          REPO="${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}"
-          docker push "$REPO:${{ steps.meta.outputs.TAG }}"
-          docker push "$REPO:latest"
+          docker push "${{ steps.meta.outputs.ECR_URI }}:${{ steps.meta.outputs.TAG }}"
+          docker push "${{ steps.meta.outputs.ECR_URI }}:latest"
 
-      - name: SSH redeploy on EC2
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ec2-user
-          key: ${{ secrets.EC2_SSH_KEY }}
-          script_stop: true
-          script: |
-            set -e
-            if ! command -v docker >/dev/null 2>&1; then
-              sudo dnf update -y || sudo yum update -y
-              if command -v dnf >/dev/null 2>&1; then
-                sudo dnf install -y docker
-              else
-                sudo yum install -y docker
-              fi
-              sudo systemctl enable --now docker
-              sudo usermod -aG docker "$USER" || true
+      - name: Discover target instances by tag (running only)
+        id: discover
+        shell: bash
+        run: |
+          set -euo pipefail
+          INSTANCE_IDS=$(aws ec2 describe-instances \
+            --filters "Name=instance-state-name,Values=running" \
+                      "Name=tag:${{ env.APP_TAG_KEY }},Values=${{ env.APP_TAG_VALUE }}" \
+            --query 'Reservations[].Instances[].InstanceId' --output text | xargs -n1 | sort -u | xargs)
+          if [ -z "$INSTANCE_IDS" ]; then
+            echo "No running instances found with tag ${{ env.APP_TAG_KEY }}=${{ env.APP_TAG_VALUE }}"; exit 1
+          fi
+          echo "INSTANCE_IDS=$INSTANCE_IDS" >> $GITHUB_OUTPUT
+
+          PUBLIC_IPS=$(aws ec2 describe-instances \
+            --instance-ids $INSTANCE_IDS \
+            --query 'Reservations[].Instances[].PublicIpAddress' --output text | xargs -n1 | sort -u | xargs)
+          echo "PUBLIC_IPS=$PUBLIC_IPS" >> $GITHUB_OUTPUT
+          echo "Found instances: $INSTANCE_IDS"
+          echo "Public IPs: $PUBLIC_IPS"
+
+      - name: Ensure SSM role & instance profile (shared) + ECR read
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROLE_NAME="EC2SSMRole"
+          PROFILE_NAME="EC2SSMInstanceProfile"
+
+          if ! aws iam get-role --role-name "$ROLE_NAME" >/dev/null 2>&1; then
+            aws iam create-role --role-name "$ROLE_NAME" --assume-role-policy-document '{
+              "Version":"2012-10-17",
+              "Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]
+            }' >/dev/null
+          fi
+
+          # Permisos: SSM + ECR (pull)
+          aws iam attach-role-policy --role-name "$ROLE_NAME" \
+            --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore || true
+          aws iam attach-role-policy --role-name "$ROLE_NAME" \
+            --policy-arn arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly || true
+
+          if ! aws iam get-instance-profile --instance-profile-name "$PROFILE_NAME" >/dev/null 2>&1; then
+            aws iam create-instance-profile --instance-profile-name "$PROFILE_NAME" >/dev/null
+          fi
+          aws iam add-role-to-instance-profile \
+            --instance-profile-name "$PROFILE_NAME" --role-name "$ROLE_NAME" 2>/dev/null || true
+
+          # Asocia el Instance Profile a cada instancia si no lo tiene
+          for ID in ${{ steps.discover.outputs.INSTANCE_IDS }}; do
+            ASSOC=$(aws ec2 describe-iam-instance-profile-associations \
+              --filters Name=instance-id,Values="$ID" \
+              --query 'IamInstanceProfileAssociations[0].AssociationId' --output text 2>/dev/null || true)
+            if [ -z "$ASSOC" ] || [ "$ASSOC" = "None" ]; then
+              aws ec2 associate-iam-instance-profile \
+                --instance-id "$ID" --iam-instance-profile Name="$PROFILE_NAME" >/dev/null
             fi
-            sudo systemctl start docker || true
-            REPO="${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}"
-            sudo docker pull "$REPO:latest"
-            sudo docker rm -f "${{ env.CONTAINER_NAME }}" || true
-            sudo docker run -d --name "${{ env.CONTAINER_NAME }}" -p 80:8080 "$REPO:latest"
+          done
+
+      - name: Open TCP/80 on all security groups (idempotent)
+        shell: bash
+        run: |
+          set -euo pipefail
+          SG_IDS=$(aws ec2 describe-instances --instance-ids ${{ steps.discover.outputs.INSTANCE_IDS }} \
+            --query 'Reservations[].Instances[].SecurityGroups[].GroupId' --output text | xargs -n1 | sort -u | xargs)
+          for SG in $SG_IDS; do
+            aws ec2 authorize-security-group-ingress --group-id "$SG" \
+              --protocol tcp --port ${{ env.PORT }} --cidr 0.0.0.0/0 2>/dev/null || true
+          done
+
+      - name: Wait for all instances to be Online in SSM
+        shell: bash
+        run: |
+          set -euo pipefail
+          for ID in ${{ steps.discover.outputs.INSTANCE_IDS }}; do
+            echo "Waiting SSM Online for $ID ..."
+            for i in {1..40}; do
+              PING=$(aws ssm describe-instance-information \
+                --filters Key=InstanceIds,Values="$ID" \
+                --query 'InstanceInformationList[0].PingStatus' --output text 2>/dev/null || true)
+              echo "  $ID PingStatus: $PING"
+              if [ "$PING" = "Online" ]; then break; fi
+              sleep 6
+              if [ $i -eq 40 ]; then echo "Instance $ID not Online in SSM"; exit 1; fi
+            done
+          done
+
+      - name: Deploy via SSM to all instances
+        id: ssm
+        shell: bash
+        run: |
+          set -euo pipefail
+          REGION="${{ secrets.AWS_REGION }}"
+          ECR_REG="${{ steps.meta.outputs.ECR_REGISTRY }}"
+          ECR_URI="${{ steps.meta.outputs.ECR_URI }}"
+          INSTANCES="${{ steps.discover.outputs.INSTANCE_IDS }}"
+
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids $INSTANCES \
+            --document-name "AWS-RunShellScript" \
+            --comment "Deploy ${ECR_URI}:latest" \
+            --parameters commands="[
+              \"set -e\",
+              \"export AWS_DEFAULT_REGION=$REGION\",
+              \"if ! command -v docker >/dev/null 2>&1; then sudo dnf -y update || sudo yum -y update; if command -v dnf >/dev/null 2>&1; then sudo dnf -y install docker; else sudo yum -y install docker; fi; sudo systemctl enable --now docker; fi\",
+              \"aws ecr get-login-password | sudo docker login --username AWS --password-stdin $ECR_REG\",
+              \"sudo systemctl start docker || true\",
+              \"sudo docker pull $ECR_URI:latest\",
+              \"sudo docker rm -f ${CONTAINER_NAME} || true\",
+              \"sudo docker run -d --name ${CONTAINER_NAME} -p ${PORT}:8080 $ECR_URI:latest\",
+              \"curl -s http://localhost/health || true\"
+            ]" \
+            --query 'Command.CommandId' --output text)
+          echo "CMD_ID=$CMD_ID" >> $GITHUB_OUTPUT
+
+          # Espera a que terminen todos en Success
+          for i in {1..40}; do
+            STATUSES=$(aws ssm list-command-invocations --command-id "$CMD_ID" --details \
+              --query 'CommandInvocations[].Status' --output text | xargs -n1 | sort -u | xargs)
+            echo "SSM statuses: $STATUSES"
+            if [ "$STATUSES" = "Success" ]; then exit 0; fi
+            if echo "$STATUSES" | grep -E -q 'Cancelled|Failed|TimedOut'; then
+              echo "Some targets failed: $STATUSES"; exit 1
+            fi
+            sleep 5
+          done
+          echo "SSM command did not complete in time"; exit 1
+
+      - name: External health check (all public IPs)
+        shell: bash
+        run: |
+          set -euo pipefail
+          IPS="${{ steps.discover.outputs.PUBLIC_IPS }}"
+          if [ -z "$IPS" ]; then
+            echo "No public IPs found to check (instances might be private)"; exit 0
+          fi
+          for IP in $IPS; do
+            echo "Checking http://$IP/health ..."
+            for i in {1..30}; do
+              CODE=$(curl -s -o /dev/null -w '%{http_code}' "http://$IP/health" || true)
+              echo "  $IP code=$CODE"
+              if [ "$CODE" = "200" ]; then
+                curl -s "http://$IP/health"
+                break
+              fi
+              sleep 3
+              if [ $i -eq 30 ]; then echo "Health check failed for $IP"; exit 1; fi
+            done
+          done
