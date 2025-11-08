@@ -1,29 +1,109 @@
-<!DOCTYPE html>
-<html lang="en">
+<!doctype html>
+<html lang="es">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>DevOps + AI Demo (Free Tier)</title>
+  <meta charset="utf-8" />
+  <title>Demo IA — Sentimiento Multilenguaje</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
   <style>
-    body { font-family: Arial, sans-serif; max-width: 720px; margin: 4rem auto; }
-    h1 { color: #2d6cdf; }
-    input, button { padding: 0.6rem; }
-    pre { background:#f6f6f6; padding:1rem; border-radius:8px; }
+    :root { --bg:#0b1220; --card:#111827; --muted:#94a3b8; --fg:#e5e7eb; --border:#1f2937;
+            --pos:#16a34a; --neg:#dc2626; --neu:#f59e0b; }
+    * { box-sizing: border-box; } body { margin:0; font-family: system-ui, sans-serif; background:var(--bg); color:var(--fg); }
+    .wrap { max-width: 760px; margin: 48px auto; padding: 0 16px; }
+    .card { background: var(--card); border:1px solid var(--border); border-radius: 16px; padding: 24px; }
+    h1 { margin:0 0 8px; font-size: 22px; } p { margin:0 0 12px; color:#a5b4fc; }
+    textarea { width: 100%; min-height: 120px; border-radius: 12px; border:1px solid var(--border); background:#0f172a; color:var(--fg); padding:12px; }
+    .row { display:flex; gap:8px; margin-top:10px; flex-wrap: wrap; }
+    button { padding:10px 14px; border-radius: 12px; border:1px solid #6366f1; background:#4f46e5; color:white; cursor:pointer; }
+    button[disabled]{ opacity:.6; cursor:not-allowed; }
+    .ghost { background:transparent; border-color:var(--border); color:var(--fg); }
+    .out { margin-top:16px; padding:12px; border-radius: 12px; background:#0b1020; border:1px solid var(--border); white-space:pre-wrap; }
+    .pill { display:inline-block; padding:4px 10px; border-radius:999px; margin-right:8px; font-weight:600; }
+    .pos { background: color-mix(in srgb, var(--pos) 25%, transparent); border:1px solid var(--pos); color:#86efac; }
+    .neg { background: color-mix(in srgb, var(--neg) 25%, transparent); border:1px solid var(--neg); color:#fecaca; }
+    .neu { background: color-mix(in srgb, var(--neu) 25%, transparent); border:1px solid var(--neu); color:#fde68a; }
+    .bars { margin-top:10px; gap:6px; display:grid; grid-template-columns: 1fr; }
+    .bar { height:12px; border-radius:6px; background:#0f172a; border:1px solid var(--border); position:relative; overflow:hidden; }
+    .bar > span { display:block; height:100%; }
+    .b-pos > span { background: color-mix(in srgb, var(--pos) 65%, transparent); }
+    .b-neg > span { background: color-mix(in srgb, var(--neg) 65%, transparent); }
+    .b-neu > span { background: color-mix(in srgb, var(--neu) 65%, transparent); }
+    .lbl { font-size:12px; color:var(--muted); margin-top:2px; }
+    small { color:var(--muted); }
   </style>
 </head>
 <body>
-  <h1>🚀 DevOps + AI (Free Tier)</h1>
-  <p>Escribe un texto y te digo el sentimiento usando VADER (ligero, ideal para capa gratuita).</p>
-  <input id="txt" placeholder="Type something..." style="width:70%"/>
-  <button onclick="go()">Predict</button>
-  <pre id="out"></pre>
+  <div class="wrap">
+    <div class="card">
+      <h1>Analizador de Sentimiento (IA Multilenguaje)</h1>
+      <p>Escribe un texto y presiona “Analizar”. Esta UI llama a <code>POST /predict</code> del mismo servidor.</p>
+
+      <div class="row">
+        <button class="ghost" data-eg="me encanta este laboratorio, es excelente">Ejemplo ES</button>
+        <button class="ghost" data-eg="this lab is awful, I hate it">Example EN</button>
+        <button class="ghost" data-eg="este laboratório é incrível, adorei">Exemplo PT</button>
+      </div>
+
+      <textarea id="text" placeholder="Escribe aquí..."></textarea>
+      <div class="row"><button id="go">Analizar</button></div>
+
+      <div id="res" class="out" style="display:none">
+        <div id="pred"></div>
+        <div class="bars">
+          <div class="bar b-pos"><span id="bpos" style="width:0%"></span></div>
+          <div class="lbl">positive: <b id="p_pos">—</b></div>
+          <div class="bar b-neu"><span id="bneu" style="width:0%"></span></div>
+          <div class="lbl">neutral: <b id="p_neu">—</b></div>
+          <div class="bar b-neg"><span id="bneg" style="width:0%"></span></div>
+          <div class="lbl">negative: <b id="p_neg">—</b></div>
+        </div>
+        <small id="meta"></small>
+      </div>
+    </div>
+  </div>
+
   <script>
-    async function go(){
-      const text = document.getElementById('txt').value;
-      const r = await fetch('/predict', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({text})});
-      const t = await r.text();
-      document.getElementById('out').textContent = t;
+    const $ = s => document.querySelector(s);
+    const $$ = s => document.querySelectorAll(s);
+    const btn = $('#go'), ta = $('#text'), res = $('#res'), pred = $('#pred');
+    const bpos = $('#bpos'), bneg = $('#bneg'), bneu = $('#bneu');
+    const ppos = $('#p_pos'), pneg = $('#p_neg'), pneu = $('#p_neu'), meta = $('#meta');
+
+    $$('.ghost').forEach(b => b.addEventListener('click', ()=> ta.value = b.dataset.eg));
+
+    function fmt(x){ return (x==null ? '—' : (x*100).toFixed(2)+'%'); }
+    function pct(x){ return Math.max(0, Math.min(100, Math.round((x||0)*100))); }
+
+    async function analyze(){
+      const text = ta.value.trim();
+      if(!text){ alert('Escribe un texto.'); return; }
+      btn.disabled = true; btn.textContent = 'Analizando...';
+      res.style.display = 'block'; pred.textContent = '...';
+      const t0 = performance.now();
+      try{
+        const r = await fetch('/predict', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text}) });
+        const j = await r.json();
+        if(!r.ok){ pred.textContent = 'Error: ' + (j?.error || r.status); return; }
+
+        const P = String(j.prediction || '').toUpperCase();
+        const pos = j?.scores?.positive ?? null;
+        const neg = j?.scores?.negative ?? null;
+        const neu = j?.scores?.neutral ?? null;
+
+        pred.innerHTML = `Predicción: <span class="pill ${P.startsWith('NEG')?'neg':P.startsWith('NEU')?'neu':'pos'}">${P}</span>`;
+        bpos.style.width = pct(pos)+'%'; ppos.textContent = fmt(pos);
+        bneg.style.width = pct(neg)+'%'; pneg.textContent = fmt(neg);
+        bneu.style.width = pct(neu)+'%'; pneu.textContent = fmt(neu);
+
+        meta.textContent = `backend: ${(j.backend||'transformers')} · tiempo: ${(performance.now()-t0).toFixed(0)} ms`;
+      }catch(e){
+        pred.textContent = 'Error de red: ' + e;
+      }finally{
+        btn.disabled = false; btn.textContent = 'Analizar';
+      }
     }
+
+    btn.addEventListener('click', analyze);
+    ta.addEventListener('keydown', e => (e.ctrlKey||e.metaKey)&&e.key==='Enter' && analyze());
   </script>
 </body>
 </html>
