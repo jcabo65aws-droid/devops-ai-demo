@@ -9,7 +9,7 @@ env:
   CONTAINER_NAME: ai-demo
   APP_TAG_KEY: App
   APP_TAG_VALUE: ai-demo
-  PORT: "80"
+  PORT: "80"                 # La app escucha en 8080 dentro del contenedor; se expone en 80
   STACK_NAME: ai-demo-ec2
 
 jobs:
@@ -63,6 +63,7 @@ jobs:
           docker push "${{ steps.meta.outputs.ECR_URI }}:${{ steps.meta.outputs.TAG }}"
           docker push "${{ steps.meta.outputs.ECR_URI }}:latest"
 
+      # ---------- Red: VPC + Subnet pública ----------
       - name: Discover default VPC + a public subnet
         id: net
         shell: bash
@@ -80,16 +81,92 @@ jobs:
           echo "VPC=$VPC" >> $GITHUB_OUTPUT
           echo "SUBNET=$SUBNET" >> $GITHUB_OUTPUT
 
+      # ---------- CloudFormation: crea/actualiza la EC2 ----------
+      - name: Write CloudFormation template
+        shell: bash
+        run: |
+          cat > /tmp/ec2-ssm-ecr.yml <<'YAML'
+          AWSTemplateFormatVersion: '2010-09-09'
+          Description: EC2 t2.micro with SSM & ECR read, SG open on 80, public IP.
+
+          Parameters:
+            VpcId:
+              Type: AWS::EC2::VPC::Id
+            SubnetId:
+              Type: AWS::EC2::Subnet::Id
+            InstanceType:
+              Type: String
+              Default: t2.micro
+              AllowedValues: [t2.micro, t3.micro, t3.small]
+            AppTagValue:
+              Type: String
+              Default: ai-demo
+
+          Resources:
+            EC2SSMRole:
+              Type: AWS::IAM::Role
+              Properties:
+                AssumeRolePolicyDocument:
+                  Version: '2012-10-17'
+                  Statement:
+                    - Effect: Allow
+                      Principal: { Service: ec2.amazonaws.com }
+                      Action: sts:AssumeRole
+                ManagedPolicyArns:
+                  - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+                  - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+
+            EC2InstanceProfile:
+              Type: AWS::IAM::InstanceProfile
+              Properties:
+                Roles: [ !Ref EC2SSMRole ]
+
+            InstanceSG:
+              Type: AWS::EC2::SecurityGroup
+              Properties:
+                GroupDescription: Allow HTTP (80) for ai-demo
+                VpcId: !Ref VpcId
+                SecurityGroupIngress:
+                  - IpProtocol: tcp
+                    FromPort: 80
+                    ToPort: 80
+                    CidrIp: 0.0.0.0/0
+                SecurityGroupEgress:
+                  - IpProtocol: -1
+                    CidrIp: 0.0.0.0/0
+
+            EC2Instance:
+              Type: AWS::EC2::Instance
+              Properties:
+                IamInstanceProfile: !Ref EC2InstanceProfile
+                InstanceType: !Ref InstanceType
+                ImageId: !Sub "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}"
+                NetworkInterfaces:
+                  - DeviceIndex: 0
+                    SubnetId: !Ref SubnetId
+                    AssociatePublicIpAddress: true
+                    GroupSet: [ !Ref InstanceSG ]
+                    DeleteOnTermination: true
+                Tags:
+                  - { Key: Name, Value: !Sub "ai-demo-${AppTagValue}" }
+                  - { Key: App,  Value: !Ref AppTagValue }
+
+          Outputs:
+            InstanceId:
+              Value: !Ref EC2Instance
+          YAML
+
       - name: Create/Update EC2 via CloudFormation
         shell: bash
         run: |
           set -euo pipefail
           aws cloudformation deploy \
             --stack-name "${{ env.STACK_NAME }}" \
-            --template-file cfn/ec2-ssm-ecr.yml \
+            --template-file /tmp/ec2-ssm-ecr.yml \
             --capabilities CAPABILITY_NAMED_IAM \
             --parameter-overrides VpcId=${{ steps.net.outputs.VPC }} SubnetId=${{ steps.net.outputs.SUBNET }} AppTagValue=${{ env.APP_TAG_VALUE }} InstanceType=t2.micro
 
+      # ---------- Descubre la instancia creada (por tag) ----------
       - name: Discover instance by tag (running only)
         id: discover
         shell: bash
@@ -120,6 +197,7 @@ jobs:
           done
           echo "Instance not Online in SSM"; exit 1
 
+      # ---------- Despliegue por SSM (sin escapes YAML problemáticos) ----------
       - name: Deploy via SSM (install docker + run container)
         shell: bash
         run: |
@@ -128,22 +206,29 @@ jobs:
           ECR_REG="${{ steps.meta.outputs.ECR_REGISTRY }}"
           ECR_URI="${{ steps.meta.outputs.ECR_URI }}"
           ID="${{ steps.discover.outputs.INSTANCE_ID }}"
+          NAME="${{ env.CONTAINER_NAME }}"
+          PORT="${{ env.PORT }}"
+
+          cat > /tmp/ssm-commands.json <<JSON
+          {
+            "commands": [
+              "set -e",
+              "if ! command -v docker >/dev/null 2>&1; then sudo dnf -y update || sudo yum -y update; if command -v dnf >/dev/null 2>&1; then sudo dnf -y install docker; else sudo yum -y install docker; fi; sudo systemctl enable --now docker; fi",
+              "aws ecr get-login-password --region ${REGION} | sudo docker login --username AWS --password-stdin ${ECR_REG}",
+              "sudo systemctl start docker || true",
+              "sudo docker pull ${ECR_URI}:latest",
+              "sudo docker rm -f ${NAME} || true",
+              "sudo docker run -d --name ${NAME} -p ${PORT}:8080 ${ECR_URI}:latest",
+              "curl -s http://localhost/health || true"
+            ]
+          }
+          JSON
 
           CMD_ID=$(aws ssm send-command \
             --instance-ids "$ID" \
             --document-name "AWS-RunShellScript" \
             --comment "Deploy ${ECR_URI}:latest" \
-            --parameters commands="[
-              \\"set -e\\",
-              \\"export AWS_DEFAULT_REGION=$REGION\\",
-              \\"if ! command -v docker >/dev/null 2>&1; then sudo dnf -y update || sudo yum -y update; if command -v dnf >/dev/null 2>&1; then sudo dnf -y install docker; else sudo yum -y install docker; fi; sudo systemctl enable --now docker; fi\\",
-              \\"aws ecr get-login-password | sudo docker login --username AWS --password-stdin $ECR_REG\\",
-              \\"sudo systemctl start docker || true\\",
-              \\"sudo docker pull $ECR_URI:latest\\",
-              \\"sudo docker rm -f ${CONTAINER_NAME} || true\\",
-              \\"sudo docker run -d --name ${CONTAINER_NAME} -p ${PORT}:8080 $ECR_URI:latest\\",
-              \\"curl -s http://localhost/health || true\\"
-            ]" \
+            --parameters file:///tmp/ssm-commands.json \
             --query 'Command.CommandId' --output text)
           echo "CMD_ID=$CMD_ID"
 
